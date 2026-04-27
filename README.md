@@ -8,3 +8,7 @@ cd eyeareseeGUI
 
 running:
 ./runit.bash
+
+
+also thanks to cfuser who made the TUI eyearesee
+https://github.com/cfsanuser/eyearesee
