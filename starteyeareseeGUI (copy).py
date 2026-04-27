@@ -742,6 +742,8 @@ class IRCMainWindow(QMainWindow):
         self.connected = False
         self.current_target = DEFAULT_CHANNEL
         self.channels_users: Dict[str, set] = {DEFAULT_CHANNEL: set()}
+        self.channel_logs: Dict[str, list] = {}
+        self.current_target = DEFAULT_CHANNEL
         self.open_windows: List[str] = ["*status*", DEFAULT_CHANNEL]
         self._history = load_history()
         self._completion_state: Optional[Dict] = None  # Track completion cycling
@@ -890,7 +892,22 @@ class IRCMainWindow(QMainWindow):
 
     def _append_status(self, text: str):
         self.lblStatus.setText(f"Status: {text}")
-        self.textBrowser.append(f'<div class="statusmsg">{_html_span("ts", _ts())} {html.escape(text)}</div>')
+        self._append_channel_line('*status*', f'<div class="statusmsg">{_html_span("ts", _ts())} {html.escape(text)}</div>')
+        self.textBrowser.moveCursor(QTextCursor.MoveOperation.End if hasattr(QTextCursor, "MoveOperation") else QTextCursor.End)
+
+    
+    def _append_channel_line(self, channel: str, html_line: str):
+        if not channel:
+            channel = "*status*"
+        self.channel_logs.setdefault(channel, []).append(html_line)
+        if channel == self.current_target:
+            self.textBrowser.append(html_line)
+            self.textBrowser.moveCursor(QTextCursor.MoveOperation.End if hasattr(QTextCursor, "MoveOperation") else QTextCursor.End)
+
+    def _refresh_channel_view(self):
+        self.textBrowser.clear()
+        for line in self.channel_logs.get(self.current_target, []):
+            self.textBrowser.append(line)
         self.textBrowser.moveCursor(QTextCursor.MoveOperation.End if hasattr(QTextCursor, "MoveOperation") else QTextCursor.End)
 
     def _append_html_line(self, html_line: str):
@@ -1059,6 +1076,7 @@ class IRCMainWindow(QMainWindow):
             return
         self.current_target = name
         self._append_status(f"Switched to {name}")
+        self._refresh_channel_view()
         if self.worker:
             self.worker.current_target = name
         users = sorted(self.channels_users.get(name, set()), key=str.lower)
@@ -1144,7 +1162,7 @@ class IRCMainWindow(QMainWindow):
             else:
                 cls = "statusmsg"
             line = f'<div>{_html_span("ts", ts)} <span class="{cls}">{nick_html}: {clean}</span></div>'
-        self._append_html_line(line)
+        self._append_channel_line(target if 'target' in locals() else ev.get('channel', self.current_target), line)
 
     def poll_events(self):
         while True:
@@ -1173,14 +1191,14 @@ class IRCMainWindow(QMainWindow):
                     self._select_channel(channel)
                     self._append_status(f"Joined {channel}")
                 else:
-                    self._append_html_line(f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(nick)}</span> joined {html.escape(channel)}</div>')
+                    self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(nick)}</span> joined {html.escape(channel)}</div>')
                     if channel == self.current_target:
                         self._refresh_user_list(sorted(self.channels_users[channel], key=str.lower))
             elif kind == "part":
                 channel = ev.get("channel", "")
                 nick = ev.get("nick", "")
                 self.channels_users.get(channel, set()).discard(nick)
-                self._append_html_line(f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(nick)}</span> left {html.escape(channel)} {html.escape(ev.get("reason", ""))}</div>')
+                self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(nick)}</span> left {html.escape(channel)} {html.escape(ev.get("reason", ""))}</div>')
                 if channel == self.current_target:
                     self._refresh_user_list(sorted(self.channels_users.get(channel, set()), key=str.lower))
             elif kind == "quit":
@@ -1189,11 +1207,11 @@ class IRCMainWindow(QMainWindow):
                     users.discard(nick)
                 if self.current_target:
                     self._refresh_user_list(sorted(self.channels_users.get(self.current_target, set()), key=str.lower))
-                self._append_html_line(f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(nick)}</span> quit {html.escape(ev.get("reason", ""))}</div>')
+                self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(nick)}</span> quit {html.escape(ev.get("reason", ""))}</div>')
             elif kind == "kick":
-                self._append_html_line(f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(ev.get("target", ""))}</span> was kicked from {html.escape(ev.get("channel", ""))}: {html.escape(ev.get("reason", ""))}</div>')
+                self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(ev.get("target", ""))}</span> was kicked from {html.escape(ev.get("channel", ""))}: {html.escape(ev.get("reason", ""))}</div>')
             elif kind == "topic":
-                self._append_html_line(f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="topicmsg">Topic for {html.escape(ev.get("channel", ""))}: {html.escape(ev.get("topic", ""))}</span></div>')
+                self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="topicmsg">Topic for {html.escape(ev.get("channel", ""))}: {html.escape(ev.get("topic", ""))}</span></div>')
             elif kind == "nick":
                 old = ev.get("old", "")
                 new = ev.get("new", "")
@@ -1204,12 +1222,12 @@ class IRCMainWindow(QMainWindow):
                 self._completion_state = None
                 if self.current_target:
                     self._refresh_user_list(sorted(self.channels_users.get(self.current_target, set()), key=str.lower))
-                self._append_html_line(f'<div>{_html_span("ts", ev.get("ts", _ts()))} {html.escape(old)} is now known as {html.escape(new)}</div>')
+                self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} {html.escape(old)} is now known as {html.escape(new)}</div>')
             elif kind == "notice":
                 target = ev.get("target", "")
                 text = html.escape(strip_irc_formatting(ev.get("text", "")))
                 cls = "directmsg" if ev.get("direct") else "noticemsg"
-                self._append_html_line(f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="{cls}">NOTICE {html.escape(ev.get("nick", ""))} → {html.escape(target)}: {text}</span></div>')
+                self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="{cls}">NOTICE {html.escape(ev.get("nick", ""))} → {html.escape(target)}: {text}</span></div>')
             elif kind == "message":
                 nick = html.escape(ev.get("nick", ""))
                 target = ev.get("target", "")
@@ -1225,7 +1243,7 @@ class IRCMainWindow(QMainWindow):
                     line = f'<div>{ts} <span class="mentionmsg">{nick}: {text}</span></div>'
                 else:
                     line = f'<div>{ts} <span class="statusmsg">{nick}: {text}</span></div>'
-                self._append_html_line(line)
+                self._append_channel_line(target if 'target' in locals() else ev.get('channel', self.current_target), line)
             elif kind == "disconnected":
                 self.connected = False
                 self.btnConnect.setText("Connect")

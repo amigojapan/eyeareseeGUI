@@ -100,6 +100,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 HISTORY_PATH = SCRIPT_DIR / "connection_history.json"
 
 IRC_CTLS_RE = re.compile(r"\x03(?:\d{1,2}(?:,\d{1,2})?)?|[\x02\x0F\x16\x1D\x1F]")
+
+
+def make_urls_clickable(text: str) -> str:
+    def repl(match):
+        url = match.group(0)
+        return f'<a href="{url}">{url}</a>'
+    return IRC_URL_RE.sub(repl, text)
+
 IRC_URL_RE = re.compile(r'https?://[^\s\x00-\x1f\x7f<>"\']+')
 
 
@@ -1150,7 +1158,7 @@ class IRCMainWindow(QMainWindow):
 
     def _append_local_message(self, target: str, nick: str, text: str, self_msg: bool = False, action: bool = False):
         ts = _ts()
-        clean = html.escape(strip_irc_formatting(text))
+        clean = make_urls_clickable(html.escape(strip_irc_formatting(text)))
         nick_html = _html_span("nick", nick)
         if action:
             line = f'<div>{_html_span("ts", ts)} <span class="actionmsg">* {nick_html} {clean}</span></div>'
@@ -1225,13 +1233,13 @@ class IRCMainWindow(QMainWindow):
                 self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} {html.escape(old)} is now known as {html.escape(new)}</div>')
             elif kind == "notice":
                 target = ev.get("target", "")
-                text = html.escape(strip_irc_formatting(ev.get("text", "")))
+                text = make_urls_clickable(html.escape(strip_irc_formatting(ev.get("text", ""))))
                 cls = "directmsg" if ev.get("direct") else "noticemsg"
                 self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="{cls}">NOTICE {html.escape(ev.get("nick", ""))} → {html.escape(target)}: {text}</span></div>')
             elif kind == "message":
                 nick = html.escape(ev.get("nick", ""))
                 target = ev.get("target", "")
-                text = html.escape(strip_irc_formatting(ev.get("text", "")))
+                text = make_urls_clickable(html.escape(strip_irc_formatting(ev.get("text", ""))))
                 ts = _html_span("ts", ev.get("ts", _ts()))
                 if ev.get("action"):
                     line = f'<div>{ts} <span class="actionmsg">* {nick} {text}</span></div>'
