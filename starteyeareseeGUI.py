@@ -844,7 +844,7 @@ class IRCMainWindow(QMainWindow):
         ch.addWidget(splitter)
 
         self.txtInput = QPlainTextEdit()
-        self.txtInput.setPlaceholderText("Type a message or /command and press Enter")
+        self.txtInput.setPlaceholderText("Type a message or /command and press Enter or start typing a nick and press [TAB] to autocomplete")
         self.txtInput.setFixedHeight(74)
         self.txtInput.installEventFilter(self)
         ch.addWidget(self.txtInput)
