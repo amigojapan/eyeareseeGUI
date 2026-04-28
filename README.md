@@ -10,11 +10,16 @@ running:
 ./runit.bash
 
 installation on windows:
+click code on this page
+
 download file as zip
+
 extract
+
 double click install_windows.bat
 
 running:
+
 double click runit.bat
 
 
