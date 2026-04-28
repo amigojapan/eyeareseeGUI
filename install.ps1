@@ -65,7 +65,7 @@ Write-Host ""
 Write-Host "To run your client:" -ForegroundColor Cyan
 Write-Host "-----------------------------------"
 Write-Host ".\venv\Scripts\Activate.ps1"
-Write-Host "python starteyeareseeGUI.py"
+Write-Host "python starteyeareseeGUI.py or double click runit.bat"
 Write-Host "-----------------------------------"
 
 Pause
