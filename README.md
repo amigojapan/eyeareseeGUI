@@ -2,7 +2,7 @@
 
 New simple-is best philsopsophy graphical IRC client
 
-installation on linux or macos:
+## installation on linux or macos:
 
 git clone https://github.com/amigojapan/eyeareseeGUI
 
@@ -14,7 +14,7 @@ running:
 
 ./runit.bash
 
-installation on windows:
+## installation on windows:
 
 click code on this page
 
