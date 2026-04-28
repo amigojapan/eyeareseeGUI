@@ -778,9 +778,11 @@ class IRCMainWindow(QMainWindow):
         top.setSpacing(6)
 
         self.txtServer = QPlainTextEdit(DEFAULT_SERVER)
+        self.txtServer.setStyleSheet('font-size: 8px')
         self.txtServer.setFixedHeight(34)
         self.txtServer.setToolTip("Server")
         self.txtPort = QPlainTextEdit(str(DEFAULT_PORT))
+        self.txtPort.setStyleSheet('font-size: 8px')
         self.txtPort.setFixedHeight(34)
         self.txtPort.setToolTip("Port")
         self.txtNick = QTextEdit(DEFAULT_NICK)
