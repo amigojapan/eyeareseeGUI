@@ -34,7 +34,8 @@ python -m venv venv
 
 
     pip install PySide6
-
+    pip install qt_material
+    
 Write-Host "Installation complete!" -ForegroundColor Green
 Write-Host "To run your client:" -ForegroundColor Cyan
 Write-Host "-----------------------------------"

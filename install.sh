@@ -34,6 +34,10 @@ else
         echo "✔ Installed PyQt5"
     fi
 fi
+if pip install qt_material; then
+    echo "✔ Installed qt_material"
+fi
+
 
 echo ""
 echo "✅ Installation complete!"

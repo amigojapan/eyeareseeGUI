@@ -15,6 +15,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from qt_material import apply_stylesheet
+
 
 try:
     from PySide6.QtCore import Qt, QEvent, QTimer, QThread, QStringListModel
@@ -93,8 +95,8 @@ except Exception:
 
 DEFAULT_SERVER = "irc.libera.chat"
 DEFAULT_PORT = 6697
-DEFAULT_NICK = "cfuser"
-DEFAULT_CHANNEL = "##anime"
+DEFAULT_NICK = ""
+DEFAULT_CHANNEL = "#eyearesee"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 HISTORY_PATH = SCRIPT_DIR / "connection_history.json"
@@ -784,6 +786,7 @@ class IRCMainWindow(QMainWindow):
         self.txtNick = QTextEdit(DEFAULT_NICK)
         self.txtNick.setFixedHeight(34)
         self.txtNick.setToolTip("Nick")
+        self.txtNick.setPlaceholderText("Nick")
         self.txtPW = QLineEdit("")
         self.txtPW.setPlaceholderText("password / NickServ")
         self.txtPW.setEchoMode(QLineEdit.EchoMode.Password if hasattr(QLineEdit, "EchoMode") else QLineEdit.Password)
@@ -1263,6 +1266,7 @@ if BINDING is None:
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    apply_stylesheet(app, theme='dark_teal.xml')
     win = IRCMainWindow()
     win.show()
     sys.exit(app.exec())
