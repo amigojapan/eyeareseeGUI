@@ -1,4 +1,4 @@
-@echo off
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 echo === IRC Client Installer (Windows) ===
 
 REM Check if Python exists
@@ -42,7 +42,7 @@ echo Installation complete!
 echo.
 echo To run the client:
 echo venv\Scripts\activate
-echo python starteyeareseeGUI_urls.py
+echo python starteyearesee.py
 echo.
 
 pause
