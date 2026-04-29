@@ -1278,8 +1278,9 @@ if __name__ == "__main__":
 
 """
 todo
-fix it so that status appears in channel list at the beginning
+handle reciving a PM by adding the person who sent it to the channels window
+store the channels I have already joined in the connnection, load whne clicking on recently connected button, per network
 highlight user with sounds and colorful text, sound only whne it is not the current channel
-make channel appear red until clicked
-fix that I cannot input Japanese into my IRC clint...
+make channel appear red until clicked when i am highlighted in that channel
+fix it so that status appears in channel list at the beginning
 """
