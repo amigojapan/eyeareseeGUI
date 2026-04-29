@@ -15,11 +15,12 @@ import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from qt_material import apply_stylesheet
 
 
 try:
-    from PySide6.QtCore import Qt, QEvent, QTimer, QThread, QStringListModel, QAbstractListModel, QModelIndex
-    from PySide6.QtGui import QColor, QFont, QTextCursor, QTextOption, QBrush
+    from PySide6.QtCore import Qt, QEvent, QTimer, QThread, QStringListModel
+    from PySide6.QtGui import QColor, QFont, QTextCursor, QTextOption
     from PySide6.QtWidgets import (
         QApplication,
         QComboBox,
@@ -42,8 +43,8 @@ try:
     BINDING = "PySide6"
 except Exception:
     try:
-        from PyQt6.QtCore import Qt, QEvent, QTimer, QThread, QStringListModel, QAbstractListModel, QModelIndex
-        from PyQt6.QtGui import QColor, QFont, QTextCursor, QTextOption, QBrush
+        from PyQt6.QtCore import Qt, QEvent, QTimer, QThread, QStringListModel
+        from PyQt6.QtGui import QColor, QFont, QTextCursor, QTextOption
         from PyQt6.QtWidgets import (
             QApplication,
             QComboBox,
@@ -67,8 +68,8 @@ except Exception:
         BINDING = "PyQt6"
     except Exception:
         try:
-            from PyQt5.QtCore import Qt, QEvent, QTimer, QThread, QStringListModel, QAbstractListModel, QModelIndex
-            from PyQt5.QtGui import QColor, QFont, QTextCursor, QTextOption, QBrush
+            from PyQt5.QtCore import Qt, QEvent, QTimer, QThread, QStringListModel
+            from PyQt5.QtGui import QColor, QFont, QTextCursor, QTextOption
             from PyQt5.QtWidgets import (
                 QApplication,
                 QComboBox,
@@ -91,8 +92,6 @@ except Exception:
             BINDING = "PyQt5"
         except Exception:
             BINDING = None
-from qt_material import apply_stylesheet
-
 
 DEFAULT_SERVER = "irc.libera.chat"
 DEFAULT_PORT = 6697
@@ -240,92 +239,7 @@ def irc_inline_to_html(text: str) -> str:
     return text
 
 
-def _network_key(server: str, port: int) -> str:
-    return f"{server}:{port}"
-
-def _normalize_windows(items: List[str]) -> List[str]:
-    ordered: List[str] = ["*status*"]
-    seen = {"*status*"}
-    for name in items:
-        if not name:
-            continue
-        if name not in seen:
-            ordered.append(name)
-            seen.add(name)
-    return ordered
-
-
-
-class ChannelListModel(QAbstractListModel):
-    def __init__(self, items: Optional[List[str]] = None, parent=None):
-        super().__init__(parent)
-        self._items: List[str] = _normalize_windows(items or [])
-        self._current: str = "*status*"
-        self._highlighted: set[str] = set()
-
-    def set_items(self, items: List[str]) -> None:
-        self.beginResetModel()
-        self._items = _normalize_windows(items)
-        self.endResetModel()
-
-    def set_current(self, current: str) -> None:
-        self._current = current or "*status*"
-        if self._items:
-            top_left = self.index(0, 0)
-            bottom_right = self.index(len(self._items) - 1, 0)
-            self.dataChanged.emit(top_left, bottom_right, [Qt.DisplayRole, Qt.ForegroundRole])
-
-    def set_highlighted(self, highlighted: set[str]) -> None:
-        self._highlighted = set(highlighted or set())
-        if self._items:
-            top_left = self.index(0, 0)
-            bottom_right = self.index(len(self._items) - 1, 0)
-            self.dataChanged.emit(top_left, bottom_right, [Qt.DisplayRole, Qt.ForegroundRole])
-
-    def add_or_move(self, name: str) -> None:
-        if not name or name == "*status*" or name in self._items:
-            return
-        self.beginResetModel()
-        self._items = _normalize_windows(self._items + [name])
-        self.endResetModel()
-
-    def remove(self, name: str) -> None:
-        if not name or name == "*status*" or name not in self._items:
-            return
-        self.beginResetModel()
-        self._items = [x for x in self._items if x != name]
-        self.endResetModel()
-
-    def rowCount(self, parent=QModelIndex()):
-        if parent.isValid():
-            return 0
-        return len(self._items)
-
-    def data(self, index, role=Qt.DisplayRole):
-        if not index or not index.isValid():
-            return None
-
-        row = index.row()
-        if row < 0 or row >= len(self._items):
-            return None
-
-        name = self._items[row]
-
-        if role == Qt.DisplayRole:
-            return name
-
-        if role == Qt.ForegroundRole:
-            if name == "*status*":
-                return QBrush(QColor("#8aa0b8"))
-            if name == self._current:
-                return QBrush(QColor("#8fd3ff"))
-            if name in self._highlighted:
-                return QBrush(QColor("red"))
-
-        return None
-
 class IRCClientThread(threading.Thread):
-
     WANT_CAPS = (
         "away-notify",
         "multi-prefix",
@@ -635,7 +549,6 @@ class IRCClientThread(threading.Thread):
 
     def _irc_001(self, nick, params, prefix):
         self.emit("status", text="Registration complete")
-        self.emit("connected", nick=self.nick)
         if self.password and not self._identified:
             self.send_raw(f"PRIVMSG NickServ :IDENTIFY {self.password}")
         if DEFAULT_CHANNEL:
@@ -837,13 +750,11 @@ class IRCMainWindow(QMainWindow):
         self.outq: queue.Queue = queue.Queue()
         self.worker: Optional[IRCClientThread] = None
         self.connected = False
-        self.current_target = "*status*"
+        self.current_target = DEFAULT_CHANNEL
         self.channels_users: Dict[str, set] = {DEFAULT_CHANNEL: set()}
         self.channel_logs: Dict[str, list] = {}
-        self.open_windows: List[str] = ["*status*"]
-        self._highlighted_windows: set[str] = set()
-        self._joined_channels: set[str] = set()
-        self._pending_autojoin: List[str] = []
+        self.current_target = DEFAULT_CHANNEL
+        self.open_windows: List[str] = ["*status*", DEFAULT_CHANNEL]
         self._history = load_history()
         self._completion_state: Optional[Dict] = None  # Track completion cycling
         self._build_ui()
@@ -923,8 +834,6 @@ class IRCMainWindow(QMainWindow):
         side.setSpacing(4)
         self.lstChannels = QListView()
         self.lstUsers = QListView()
-        self._channels_model = ChannelListModel(self.open_windows, self)
-        self.lstChannels.setModel(self._channels_model)
         side.addWidget(self.lstChannels, 2)
         side.addWidget(self.lstUsers, 1)
 
@@ -947,8 +856,6 @@ class IRCMainWindow(QMainWindow):
         self.lblStatus = QLabel("Status: Ready")
         root.addWidget(self.lblStatus)
 
-        self._refresh_channel_list()
-
     def _load_history_combo(self):
         self.cmbConnectionHistory.clear()
         self.cmbConnectionHistory.addItem("Recent connections…")
@@ -965,15 +872,6 @@ class IRCMainWindow(QMainWindow):
         self.txtServer.setPlainText(str(item.get("server", DEFAULT_SERVER)))
         self.txtPort.setPlainText(str(item.get("port", DEFAULT_PORT)))
         self.txtNick.setPlainText(str(item.get("nick", DEFAULT_NICK)))
-        channels = [c for c in item.get("channels", []) if isinstance(c, str) and c]
-        self._pending_autojoin = channels[:]
-        self._joined_channels = set(channels)
-        self.open_windows = _normalize_windows(["*status*"] + channels)
-        if channels:
-            self.current_target = channels[0]
-        else:
-            self.current_target = DEFAULT_CHANNEL
-        self._refresh_channel_list()
 
     def _is_keypress(self, event) -> bool:
         try:
@@ -1013,44 +911,6 @@ class IRCMainWindow(QMainWindow):
         self.textBrowser.moveCursor(QTextCursor.MoveOperation.End if hasattr(QTextCursor, "MoveOperation") else QTextCursor.End)
 
     
-    def _ordered_windows(self) -> List[str]:
-        return _normalize_windows(self.open_windows)
-
-    def _persist_history_state(self) -> None:
-        server = self._ui_server()
-        port = self._ui_port()
-        nick = self._ui_nick()
-        channels = sorted(ch for ch in self._joined_channels if ch)
-        key = _network_key(server, port)
-        updated = False
-        for item in self._history:
-            try:
-                if _network_key(str(item.get("server", "")), int(item.get("port", 0) or 0)) == key:
-                    item["server"] = server
-                    item["port"] = port
-                    item["nick"] = nick
-                    item["channels"] = channels
-                    updated = True
-                    break
-            except Exception:
-                continue
-        if not updated:
-            self._history.insert(0, {"server": server, "port": port, "nick": nick, "channels": channels})
-        save_history(self._history)
-        self._load_history_combo()
-
-    def _refresh_channel_list(self):
-        self._channels_model.set_items(self._ordered_windows())
-        self._channels_model.set_current(self.current_target)
-        self._channels_model.set_highlighted(self._highlighted_windows)
-        self.lstChannels.setModel(self._channels_model)
-        try:
-            self.lstChannels.clicked.disconnect()
-        except Exception:
-            pass
-        self.lstChannels.clicked.connect(lambda idx: self._select_channel(self._channels_model.data(idx, Qt.DisplayRole)))
-        self._channels_model.add_or_move("*status*")
-
     def _append_channel_line(self, channel: str, html_line: str):
         if not channel:
             channel = "*status*"
@@ -1184,7 +1044,6 @@ class IRCMainWindow(QMainWindow):
 
     def toggle_connection(self):
         if self.worker and self.worker.is_alive():
-            self._persist_history_state()
             self.worker.disconnect("Leaving")
             self.worker = None
             self.connected = False
@@ -1197,50 +1056,40 @@ class IRCMainWindow(QMainWindow):
         nick = self._ui_nick()
         pw = self._ui_password()
         use_ssl = port == 6697 or port == 6697
-        self._pending_autojoin = list(dict.fromkeys(self._pending_autojoin))
         self.worker = IRCClientThread(server, port, nick, pw, use_ssl, self.outq, self.eventq)
         self.worker.start()
         self.connected = True
         self.btnConnect.setText("Disconnect")
         self._append_status(f"Connecting to {server}:{port} as {nick}")
-        self._persist_history_state()
+        self._history = [h for h in self._history if not (h.get('server') == server and str(h.get('port')) == str(port) and h.get('nick') == nick)]
+        self._history.insert(0, {"server": server, "port": port, "nick": nick})
+        save_history(self._history)
+        self._load_history_combo()
 
     def _ensure_channel(self, name: str):
-        if not name or name == "*status*":
-            return
         if name not in self.open_windows:
             self.open_windows.append(name)
             self._refresh_channel_list()
+
+    def _refresh_channel_list(self):
+        model = QStringListModel(self.open_windows)
+        self.lstChannels.setModel(model)
+        try:
+            self.lstChannels.clicked.disconnect()
+        except Exception:
+            pass
+        self.lstChannels.clicked.connect(lambda idx: self._select_channel(model.data(idx)))
+        self._channels_model = model
 
     def _refresh_user_list(self, users: List[str]):
         model = QStringListModel(users)
         self.lstUsers.setModel(model)
         self._users_model = model
 
-    def _mark_highlight(self, channel: str, play_sound: bool = True) -> None:
-        if not channel or channel == self.current_target or channel == "*status*":
-            return
-        self._highlighted_windows.add(channel)
-        if play_sound:
-            try:
-                QApplication.beep()
-            except Exception:
-                pass
-        self._refresh_channel_list()
-
-    def _clear_highlight(self, channel: str) -> None:
-        if channel in self._highlighted_windows:
-            self._highlighted_windows.discard(channel)
-            self._refresh_channel_list()
-
-    def _history_channels_for_save(self) -> List[str]:
-        return sorted(ch for ch in self._joined_channels if ch)
-
     def _select_channel(self, name: str):
         if not name:
             return
         self.current_target = name
-        self._clear_highlight(name)
         self._append_status(f"Switched to {name}")
         self._refresh_channel_view()
         if self.worker:
@@ -1272,16 +1121,11 @@ class IRCMainWindow(QMainWindow):
             if self.worker and arg:
                 self.worker.cmd_join(arg)
                 self._ensure_channel(arg)
-                self._joined_channels.add(arg)
-                self._persist_history_state()
                 self._select_channel(arg)
         elif cmd == "part":
             chan = arg or self.current_target or DEFAULT_CHANNEL
             if self.worker:
                 self.worker.cmd_part(chan)
-                if chan in self._joined_channels:
-                    self._joined_channels.discard(chan)
-                    self._persist_history_state()
         elif cmd == "me":
             if self.worker:
                 self._append_local_message(self.current_target or DEFAULT_CHANNEL, self._ui_nick(), arg, self_msg=True, action=True)
@@ -1292,7 +1136,6 @@ class IRCMainWindow(QMainWindow):
                 if len(tparts) == 2:
                     target, body = tparts
                     self._append_local_message(target, self._ui_nick(), body, self_msg=True)
-                    self._ensure_channel(target)
                     self.worker.cmd_msg(target, body)
         elif cmd == "notice":
             if self.worker and arg:
@@ -1334,8 +1177,7 @@ class IRCMainWindow(QMainWindow):
             else:
                 cls = "statusmsg"
             line = f'<div>{_html_span("ts", ts)} <span class="{cls}">{nick_html}: {clean}</span></div>'
-        self._ensure_channel(target)
-        self._append_channel_line(target, line)
+        self._append_channel_line(target if 'target' in locals() else ev.get('channel', self.current_target), line)
 
     def poll_events(self):
         while True:
@@ -1346,15 +1188,6 @@ class IRCMainWindow(QMainWindow):
             kind = ev.get("type")
             if kind == "status":
                 self._append_status(ev.get("text", ""))
-            elif kind == "connected":
-                if self._pending_autojoin and self.worker:
-                    for chan in list(dict.fromkeys(self._pending_autojoin)):
-                        if chan and chan != "*status*":
-                            self.worker.cmd_join(chan)
-                            self._ensure_channel(chan)
-                            self._joined_channels.add(chan)
-                    self._pending_autojoin = []
-                    self._persist_history_state()
             elif kind == "names":
                 channel = ev.get("channel", "")
                 users = ev.get("users", [])
@@ -1367,28 +1200,22 @@ class IRCMainWindow(QMainWindow):
                 channel = ev.get("channel", "")
                 nick = ev.get("nick", "")
                 self.channels_users.setdefault(channel, set()).add(nick)
+                self._ensure_channel(channel)
                 if ev.get("self_join"):
-                    self._joined_channels.add(channel)
-                    self._ensure_channel(channel)
                     self.current_target = channel
                     self._select_channel(channel)
                     self._append_status(f"Joined {channel}")
-                    self._persist_history_state()
                 else:
-                    self._ensure_channel(channel)
-                    self._append_channel_line(channel, f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(nick)}</span> joined {html.escape(channel)}</div>')
+                    self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(nick)}</span> joined {html.escape(channel)}</div>')
                     if channel == self.current_target:
                         self._refresh_user_list(sorted(self.channels_users[channel], key=str.lower))
             elif kind == "part":
                 channel = ev.get("channel", "")
                 nick = ev.get("nick", "")
                 self.channels_users.get(channel, set()).discard(nick)
-                self._append_channel_line(channel, f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(nick)}</span> left {html.escape(channel)} {html.escape(ev.get("reason", ""))}</div>')
+                self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(nick)}</span> left {html.escape(channel)} {html.escape(ev.get("reason", ""))}</div>')
                 if channel == self.current_target:
                     self._refresh_user_list(sorted(self.channels_users.get(channel, set()), key=str.lower))
-                if channel in self._joined_channels and (nick == self._ui_nick() or ev.get("self_part")):
-                    self._joined_channels.discard(channel)
-                    self._persist_history_state()
             elif kind == "quit":
                 nick = ev.get("nick", "")
                 for users in self.channels_users.values():
@@ -1397,11 +1224,9 @@ class IRCMainWindow(QMainWindow):
                     self._refresh_user_list(sorted(self.channels_users.get(self.current_target, set()), key=str.lower))
                 self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(nick)}</span> quit {html.escape(ev.get("reason", ""))}</div>')
             elif kind == "kick":
-                channel = ev.get("channel", self.current_target)
-                self._append_channel_line(channel, f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(ev.get("target", ""))}</span> was kicked from {html.escape(ev.get("channel", ""))}: {html.escape(ev.get("reason", ""))}</div>')
+                self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(ev.get("target", ""))}</span> was kicked from {html.escape(ev.get("channel", ""))}: {html.escape(ev.get("reason", ""))}</div>')
             elif kind == "topic":
-                channel = ev.get("channel", self.current_target)
-                self._append_channel_line(channel, f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="topicmsg">Topic for {html.escape(ev.get("channel", ""))}: {html.escape(ev.get("topic", ""))}</span></div>')
+                self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="topicmsg">Topic for {html.escape(ev.get("channel", ""))}: {html.escape(ev.get("topic", ""))}</span></div>')
             elif kind == "nick":
                 old = ev.get("old", "")
                 new = ev.get("new", "")
@@ -1409,10 +1234,6 @@ class IRCMainWindow(QMainWindow):
                     if old in users:
                         users.discard(old)
                         users.add(new)
-                if old in self._joined_channels:
-                    self._joined_channels.discard(old)
-                    self._joined_channels.add(new)
-                    self._persist_history_state()
                 self._completion_state = None
                 if self.current_target:
                     self._refresh_user_list(sorted(self.channels_users.get(self.current_target, set()), key=str.lower))
@@ -1421,32 +1242,23 @@ class IRCMainWindow(QMainWindow):
                 target = ev.get("target", "")
                 text = make_urls_clickable(html.escape(strip_irc_formatting(ev.get("text", ""))))
                 cls = "directmsg" if ev.get("direct") else "noticemsg"
-                channel = target if target != self._ui_nick() else ev.get('nick', self.current_target)
-                self._ensure_channel(channel)
-                self._append_channel_line(channel, f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="{cls}">NOTICE {html.escape(ev.get("nick", ""))} → {html.escape(target)}: {text}</span></div>')
-                if (ev.get("direct") or ev.get("nick") == self._ui_nick()) and channel != self.current_target:
-                    self._mark_highlight(channel, play_sound=True)
+                self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="{cls}">NOTICE {html.escape(ev.get("nick", ""))} → {html.escape(target)}: {text}</span></div>')
             elif kind == "message":
                 nick = html.escape(ev.get("nick", ""))
                 target = ev.get("target", "")
-                is_direct = bool(ev.get("direct"))
-                display_target = ev.get("nick", target) if is_direct else target
                 text = make_urls_clickable(html.escape(strip_irc_formatting(ev.get("text", ""))))
                 ts = _html_span("ts", ev.get("ts", _ts()))
                 if ev.get("action"):
                     line = f'<div>{ts} <span class="actionmsg">* {nick} {text}</span></div>'
                 elif ev.get("self_msg"):
                     line = f'<div>{ts} <span class="selfmsg">{nick}: {text}</span></div>'
-                elif is_direct:
+                elif ev.get("direct"):
                     line = f'<div>{ts} <span class="directmsg">{nick}: {text}</span></div>'
                 elif ev.get("mention"):
                     line = f'<div>{ts} <span class="mentionmsg">{nick}: {text}</span></div>'
                 else:
                     line = f'<div>{ts} <span class="statusmsg">{nick}: {text}</span></div>'
-                self._ensure_channel(display_target)
-                self._append_channel_line(display_target, line)
-                if (ev.get("mention") or is_direct) and display_target != self.current_target:
-                    self._mark_highlight(display_target, play_sound=True)
+                self._append_channel_line(target if 'target' in locals() else ev.get('channel', self.current_target), line)
             elif kind == "disconnected":
                 self.connected = False
                 self.btnConnect.setText("Connect")
@@ -1463,12 +1275,12 @@ if __name__ == "__main__":
     win.show()
     sys.exit(app.exec())
 
+
 """
 todo
+handle reciving a PM by adding the person who sent it to the channels window
 store the channels I have already joined in the connnection, load whne clicking on recently connected button, per network
 highlight user with sounds and colorful text, sound only whne it is not the current channel
 make channel appear red until clicked when i am highlighted in that channel
-
-make quit join and part messages appear only in the channel where those users are in
-make quit part and joins appear as a resume of all the ones intead of adding a new line per each, modify th4e previous line, unless there have been new messages
+fix it so that status appears in channel list at the beginning
 """

@@ -2,7 +2,12 @@
   {
     "server": "irc.libera.chat",
     "port": 6697,
-    "nick": "amigojapan"
+    "nick": "amigojapan",
+    "channels": [
+      "##japanese",
+      "##programming",
+      "#eyearesee"
+    ]
   },
   {
     "server": "irc.dal.net",
