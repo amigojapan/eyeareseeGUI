@@ -845,8 +845,10 @@ class IRCMainWindow(QMainWindow):
 
         self.txtInput = QPlainTextEdit()
         self.txtInput.setPlaceholderText("Type a message or /command and press Enter or start typing a nick and press [TAB] to autocomplete")
+        
         self.txtInput.setFixedHeight(74)
         self.txtInput.installEventFilter(self)
+        self.txtInput.setFocus()
         ch.addWidget(self.txtInput)
 
         root.addWidget(self.frmChatarea, 1)
@@ -1272,3 +1274,12 @@ if __name__ == "__main__":
     win = IRCMainWindow()
     win.show()
     sys.exit(app.exec())
+
+
+"""
+todo
+fix it so that status appears in channel list at the beginning
+highlight user with sounds and colorful text, sound only whne it is not the current channel
+make channel appear red until clicked
+fix that I cannot input Japanese into my IRC clint...
+"""

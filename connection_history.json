@@ -1,11 +1,11 @@
 [
   {
-    "server": "irc.dal.net",
+    "server": "irc.libera.chat",
     "port": 6697,
     "nick": "amigojapan"
   },
   {
-    "server": "irc.libera.chat",
+    "server": "irc.dal.net",
     "port": 6697,
     "nick": "amigojapan"
   }
