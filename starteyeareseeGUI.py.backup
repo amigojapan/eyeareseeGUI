@@ -785,6 +785,14 @@ class IRCClientThread(threading.Thread):
                     merged = "\n".join(x[2][1] for x in buffered if x[0] == "PRIVMSG" and len(x[2]) > 1)
                     self.emit("message", nick=bnick, target=target, text=merged, ts=_ts(), action=False, self_msg=(bnick == self.nick), direct=(target == self.nick), mention=(self.nick.lower() in merged.lower()))
 
+    def _irc_tagmsg(self, nick, params, prefix):
+        if not params:
+            return
+        target = params[0]
+        state = self._current_msg_tags.get("+typing") or self._current_msg_tags.get("typing") or self._current_msg_tags.get("+typing".lower())
+        if isinstance(state, str) and state:
+            self.emit("typing", channel=target, nick=nick, state=state, ts=_ts())
+
     def _irc_301(self, nick, params, prefix):
         if len(params) >= 2:
             self.emit("status", text=f"Away: {' '.join(params[1:])}")
@@ -829,6 +837,7 @@ class IRCClientThread(threading.Thread):
 
 
 class IRCMainWindow(QMainWindow):
+    _instances: List["IRCMainWindow"] = []
     def __init__(self):
         super().__init__()  # MUST call parent __init__ FIRST
         self.setWindowTitle("eye are see GUI")
@@ -846,6 +855,11 @@ class IRCMainWindow(QMainWindow):
         self._pending_autojoin: List[str] = []
         self._history = load_history()
         self._completion_state: Optional[Dict] = None  # Track completion cycling
+        self._presence_summaries: Dict[str, Dict[str, object]] = {}
+        self._typing_state: Dict[str, set] = {}
+        self._typing_last_sent: Dict[str, float] = {}
+        self._typing_timer: Optional[QTimer] = None
+        self._pending_self_parts: set[str] = set()
         self._build_ui()
         self._load_history_combo()
         self._append_status("Ready.")
@@ -882,12 +896,14 @@ class IRCMainWindow(QMainWindow):
         self.txtPW.setPlaceholderText("password / NickServ")
         self.txtPW.setEchoMode(QLineEdit.EchoMode.Password if hasattr(QLineEdit, "EchoMode") else QLineEdit.Password)
         self.btnConnect = QPushButton("Connect")
+        self.btnNewWindow = QPushButton("New Window")
         self.cmbConnectionHistory = QComboBox()
         self.cmbConnectionHistory.setToolTip("Connection History")
         self.cmbConnectionHistory.currentIndexChanged.connect(self._apply_history_item)
         self.btnConnect.clicked.connect(self.toggle_connection)
+        self.btnNewWindow.clicked.connect(self._spawn_new_window)
 
-        for w in (self.txtServer, self.txtPort, self.txtNick, self.txtPW, self.btnConnect, self.cmbConnectionHistory):
+        for w in (self.txtServer, self.txtPort, self.txtNick, self.txtPW, self.btnConnect, self.btnNewWindow, self.cmbConnectionHistory):
             top.addWidget(w)
 
         root.addWidget(self.frmLogin)
@@ -939,6 +955,10 @@ class IRCMainWindow(QMainWindow):
         
         self.txtInput.setFixedHeight(74)
         self.txtInput.installEventFilter(self)
+        self.txtInput.textChanged.connect(self._on_input_changed)
+        self._typing_timer = QTimer(self)
+        self._typing_timer.setSingleShot(True)
+        self._typing_timer.timeout.connect(self._typing_pause_tick)
         self.txtInput.setFocus()
         ch.addWidget(self.txtInput)
 
@@ -946,7 +966,129 @@ class IRCMainWindow(QMainWindow):
 
         self.lblStatus = QLabel("Status: Ready")
         root.addWidget(self.lblStatus)
+        self._refresh_channel_list()
 
+        self._refresh_channel_list()
+
+
+    def _spawn_new_window(self):
+        try:
+            win = IRCMainWindow()
+            win.show()
+            IRCMainWindow._instances.append(win)
+            try:
+                def _cleanup(*_):
+                    IRCMainWindow._instances[:] = [w for w in IRCMainWindow._instances if w is not win]
+                win.destroyed.connect(_cleanup)
+            except Exception:
+                pass
+        except Exception as exc:
+            self._append_status(f"Could not open new window: {exc}")
+
+    def _typing_target(self) -> str:
+        return self.current_target or DEFAULT_CHANNEL
+
+    def _on_input_changed(self):
+        target = self._typing_target()
+        text = self._current_input_text()
+        if not self.worker or not target:
+            return
+        # Never send typing for slash commands.
+        if text.startswith("/"):
+            self._send_typing_state("done")
+            return
+        if not text:
+            self._send_typing_state("done")
+            return
+        self._send_typing_state("active")
+        if self._typing_timer is not None:
+            self._typing_timer.start(3000)
+
+    def _typing_pause_tick(self):
+        text = self._current_input_text()
+        if not text or text.startswith("/"):
+            self._send_typing_state("done")
+        else:
+            self._send_typing_state("paused")
+
+    def _send_typing_state(self, state: str):
+        if not self.worker:
+            return
+        if "message-tags" not in self.worker._active_caps:
+            return
+        if "draft/typing" not in self.worker._active_caps and "typing" not in self.worker._active_caps:
+            return
+        target = self._typing_target()
+        now = time.monotonic()
+        last = self._typing_last_sent.get(target, 0.0)
+        # Throttle to every 3 seconds per target per IRCv3 typing spec.
+        if state == "active" and now - last < 3.0:
+            return
+        if state in ("paused", "done") and now - last < 3.0 and state != "done":
+            return
+        self._typing_last_sent[target] = now
+        if state == "done" and self._typing_timer is not None:
+            self._typing_timer.stop()
+        try:
+            self.worker.send_tagged({"+typing": state}, f"TAGMSG {target}")
+        except Exception:
+            pass
+
+    def _invalidate_presence_summary(self, channel: str):
+        self._presence_summaries.pop(channel, None)
+
+    def _render_presence_summary(self, kind: str, items: List[str]) -> str:
+        ts = _html_span("ts", _ts())
+        verbs = {
+            "join": "joined",
+            "part": "parted",
+            "quit": "quit",
+        }
+        verb = verbs.get(kind, kind)
+        body = ", ".join(html.escape(x) for x in items)
+        return f'<div>{ts} <span class="statusmsg">{body} {verb}</span></div>'
+
+    def _append_presence_summary(self, channel: str, kind: str, text: str):
+        if not channel:
+            channel = "*status*"
+        self.channel_logs.setdefault(channel, [])
+        state = self._presence_summaries.get(channel)
+        if state and state.get("kind") == kind:
+            items = state.setdefault("items", [])
+            if text not in items:
+                items.append(text)
+            line = self._render_presence_summary(kind, items)
+            idx = int(state["index"])
+            self.channel_logs[channel][idx] = line
+            if channel == self.current_target:
+                self._refresh_channel_view()
+            return
+
+        line = self._render_presence_summary(kind, [text])
+        self.channel_logs[channel].append(line)
+        self._presence_summaries[channel] = {"kind": kind, "index": len(self.channel_logs[channel]) - 1, "items": [text]}
+        if channel == self.current_target:
+            self.textBrowser.append(line)
+            self.textBrowser.moveCursor(QTextCursor.MoveOperation.End if hasattr(QTextCursor, "MoveOperation") else QTextCursor.End)
+
+    def _close_window(self, name: str, remove_saved: bool = False):
+        if not name or name == "*status*":
+            return
+        self._invalidate_presence_summary(name)
+        self._highlighted_windows.discard(name)
+        self.channel_logs.pop(name, None)
+        self.channels_users.pop(name, None)
+        if name in self.open_windows:
+            self.open_windows = [x for x in self.open_windows if x != name]
+        if remove_saved and name in self._joined_channels:
+            self._joined_channels.discard(name)
+            self._persist_history_state()
+        if self.current_target == name:
+            self.current_target = "*status*"
+            if self.worker:
+                self.worker.current_target = "*status*"
+            self._refresh_channel_view()
+            self._refresh_user_list([])
         self._refresh_channel_list()
 
     def _load_history_combo(self):
@@ -1054,6 +1196,7 @@ class IRCMainWindow(QMainWindow):
     def _append_channel_line(self, channel: str, html_line: str):
         if not channel:
             channel = "*status*"
+        self._invalidate_presence_summary(channel)
         self.channel_logs.setdefault(channel, []).append(html_line)
         if channel == self.current_target:
             self.textBrowser.append(html_line)
@@ -1241,6 +1384,7 @@ class IRCMainWindow(QMainWindow):
             return
         self.current_target = name
         self._clear_highlight(name)
+        self._typing_state.pop(name, None)
         self._append_status(f"Switched to {name}")
         self._refresh_channel_view()
         if self.worker:
@@ -1254,6 +1398,7 @@ class IRCMainWindow(QMainWindow):
             return
         self.txtInput.clear()
         self._completion_state = None  # Reset completion state on send
+        self._send_typing_state("done")
         target = self.current_target or DEFAULT_CHANNEL
         if text.startswith("/"):
             self._handle_command(text[1:])
@@ -1279,9 +1424,9 @@ class IRCMainWindow(QMainWindow):
             chan = arg or self.current_target or DEFAULT_CHANNEL
             if self.worker:
                 self.worker.cmd_part(chan)
-                if chan in self._joined_channels:
-                    self._joined_channels.discard(chan)
-                    self._persist_history_state()
+            if chan and chan[0] in "#&!+":
+                self._pending_self_parts.add(chan)
+            self._close_window(chan, remove_saved=True)
         elif cmd == "me":
             if self.worker:
                 self._append_local_message(self.current_target or DEFAULT_CHANNEL, self._ui_nick(), arg, self_msg=True, action=True)
@@ -1319,6 +1464,26 @@ class IRCMainWindow(QMainWindow):
                 self.worker.cmd_raw(f"TOPIC {self.current_target or DEFAULT_CHANNEL} :{arg}")
         else:
             self._append_status(f"Unknown command: /{cmd}")
+
+
+    def _update_remote_typing(self, channel: str, nick: str, state: str):
+        if not channel or not nick or nick == self._ui_nick():
+            return
+        current = self._typing_state.setdefault(channel, set())
+        if state == "done":
+            current.discard(nick)
+            return
+        if state in ("active", "paused"):
+            if nick not in current:
+                current.add(nick)
+                if channel == self.current_target:
+                    self._append_channel_line(channel, f'<div>{_html_span("ts", _ts())} <span class="mentionmsg">{html.escape(nick)} is typing…</span></div>')
+                else:
+                    self._mark_highlight(channel, play_sound=False)
+            return
+
+    def _append_message_to_channel(self, channel: str, html_line: str):
+        self._append_channel_line(channel, html_line)
 
     def _append_local_message(self, target: str, nick: str, text: str, self_msg: bool = False, action: bool = False):
         ts = _ts()
@@ -1366,24 +1531,36 @@ class IRCMainWindow(QMainWindow):
             elif kind == "join":
                 channel = ev.get("channel", "")
                 nick = ev.get("nick", "")
+                self._pending_self_parts.discard(channel)
                 self.channels_users.setdefault(channel, set()).add(nick)
+                self._ensure_channel(channel)
+                self._append_presence_summary(channel, "join", nick)
                 if ev.get("self_join"):
                     self._joined_channels.add(channel)
-                    self._ensure_channel(channel)
                     self.current_target = channel
                     self._select_channel(channel)
                     self._append_status(f"Joined {channel}")
                     self._persist_history_state()
-                else:
-                    self._ensure_channel(channel)
-                    self._append_channel_line(channel, f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(nick)}</span> joined {html.escape(channel)}</div>')
-                    if channel == self.current_target:
-                        self._refresh_user_list(sorted(self.channels_users[channel], key=str.lower))
+                elif channel == self.current_target:
+                    self._refresh_user_list(sorted(self.channels_users[channel], key=str.lower))
             elif kind == "part":
                 channel = ev.get("channel", "")
                 nick = ev.get("nick", "")
+                if channel in self._pending_self_parts and nick == self._ui_nick():
+                    self._pending_self_parts.discard(channel)
+                    self._joined_channels.discard(channel)
+                    self._persist_history_state()
+                    self.channels_users.pop(channel, None)
+                    self.channel_logs.pop(channel, None)
+                    if channel in self.open_windows:
+                        self.open_windows = [x for x in self.open_windows if x != channel]
+                        self._refresh_channel_list()
+                    if self.current_target == channel:
+                        self.current_target = "*status*"
+                        self._refresh_channel_view()
+                    continue
                 self.channels_users.get(channel, set()).discard(nick)
-                self._append_channel_line(channel, f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(nick)}</span> left {html.escape(channel)} {html.escape(ev.get("reason", ""))}</div>')
+                self._append_presence_summary(channel, "part", nick)
                 if channel == self.current_target:
                     self._refresh_user_list(sorted(self.channels_users.get(channel, set()), key=str.lower))
                 if channel in self._joined_channels and (nick == self._ui_nick() or ev.get("self_part")):
@@ -1391,11 +1568,16 @@ class IRCMainWindow(QMainWindow):
                     self._persist_history_state()
             elif kind == "quit":
                 nick = ev.get("nick", "")
-                for users in self.channels_users.values():
-                    users.discard(nick)
-                if self.current_target:
+                relevant_channels = [ch for ch, users in self.channels_users.items() if nick in users and ch != "*status*"]
+                for ch in relevant_channels:
+                    self.channels_users.get(ch, set()).discard(nick)
+                    self._append_presence_summary(ch, "quit", nick)
+                    self._typing_state.get(ch, set()).discard(nick)
+                if self.current_target in relevant_channels:
                     self._refresh_user_list(sorted(self.channels_users.get(self.current_target, set()), key=str.lower))
-                self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(nick)}</span> quit {html.escape(ev.get("reason", ""))}</div>')
+                for ch in relevant_channels:
+                    self._highlighted_windows.discard(ch)
+                self._refresh_channel_list()
             elif kind == "kick":
                 channel = ev.get("channel", self.current_target)
                 self._append_channel_line(channel, f'<div>{_html_span("ts", ev.get("ts", _ts()))} <span class="nick">{html.escape(ev.get("target", ""))}</span> was kicked from {html.escape(ev.get("channel", ""))}: {html.escape(ev.get("reason", ""))}</div>')
@@ -1445,14 +1627,19 @@ class IRCMainWindow(QMainWindow):
                     line = f'<div>{ts} <span class="statusmsg">{nick}: {text}</span></div>'
                 self._ensure_channel(display_target)
                 self._append_channel_line(display_target, line)
+                self._typing_state.get(display_target, set()).discard(ev.get("nick", ""))
                 if (ev.get("mention") or is_direct) and display_target != self.current_target:
                     self._mark_highlight(display_target, play_sound=True)
+            elif kind == "typing":
+                channel = ev.get("channel", "")
+                nick = ev.get("nick", "")
+                state = ev.get("state", "")
+                if channel and nick:
+                    self._update_remote_typing(channel, nick, state)
             elif kind == "disconnected":
                 self.connected = False
                 self.btnConnect.setText("Connect")
                 self._append_status(ev.get("text", "Disconnected"))
-
-
 if BINDING is None:
     raise SystemExit("PySide6 / PyQt6 / PyQt5 is not installed. Install one of them to run this GUI.")
 
@@ -1465,17 +1652,12 @@ if __name__ == "__main__":
 
 """
 todo
+add support for displaying and entering mIRC colors
 
-make quit join and part messages appear only in the channel where those users are in
-make quit part and joins appear as a resume of all the ones intead of adding a new line per each, modify th4e previous line, unless there have been new messages
-make a new window button that displays a new copy of hte window so I can connect to another network
-make it support the IRCv3 spec where you can see when people are typing and send when youa re typing too
-make the private message dissapear if you type /part, and also part and amke the channel dissapear form channels in the saves list when someone types /part
-
-things I asked you to do but you did not do:
+make it support the IRCv3 spec where you can see when people are typing (this should apapear in the bottom status bar, but it appears in hte main chat window) and send when youa re typing too(this does not seem to be working at all)
 highlight user with sounds and colorful text, sound only whne it is not the current channel
 make channel appear red until clicked when i am highlighted in that channel
- 
+move the new window button tot he bottom righht of the window
 
-also, dont modify the GUI look.
+remember to keep same look, use deep thinking and hten let me download the patched file
 """

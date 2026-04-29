@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 try:
     from PySide6.QtCore import Qt, QEvent, QTimer, QThread, QStringListModel, QAbstractListModel, QModelIndex
-    from PySide6.QtGui import QColor, QFont, QTextCursor, QTextOption, QBrush
+    from PySide6.QtGui import QColor, QFont, QTextCursor, QTextOption, QBrush, QTextCharFormat, QTextDocument
     from PySide6.QtWidgets import (
         QApplication,
         QComboBox,
@@ -43,7 +43,7 @@ try:
 except Exception:
     try:
         from PyQt6.QtCore import Qt, QEvent, QTimer, QThread, QStringListModel, QAbstractListModel, QModelIndex
-        from PyQt6.QtGui import QColor, QFont, QTextCursor, QTextOption, QBrush
+        from PyQt6.QtGui import QColor, QFont, QTextCursor, QTextOption, QBrush, QTextCharFormat, QTextDocument
         from PyQt6.QtWidgets import (
             QApplication,
             QComboBox,
@@ -68,7 +68,7 @@ except Exception:
     except Exception:
         try:
             from PyQt5.QtCore import Qt, QEvent, QTimer, QThread, QStringListModel, QAbstractListModel, QModelIndex
-            from PyQt5.QtGui import QColor, QFont, QTextCursor, QTextOption, QBrush
+            from PyQt5.QtGui import QColor, QFont, QTextCursor, QTextOption, QBrush, QTextCharFormat, QTextDocument
             from PyQt5.QtWidgets import (
                 QApplication,
                 QComboBox,
@@ -102,8 +102,44 @@ DEFAULT_CHANNEL = "#eyearesee"
 SCRIPT_DIR = Path(__file__).resolve().parent
 HISTORY_PATH = SCRIPT_DIR / "connection_history.json"
 
+# mIRC color support
+IRC_COLOR_RE = re.compile(r'\x03(\d{1,2})(?:,(\d{1,2}))?')
 IRC_CTLS_RE = re.compile(r"\x03(?:\d{1,2}(?:,\d{1,2})?)?|[\x02\x0F\x16\x1D\x1F]")
 
+IRC_URL_RE = re.compile(r'https?://[^\s\x00-\x1f\x7f<>"\']+')
+
+MIRC_COLOR_MAP = {
+    0: "#FFFFFF", 1: "#000000", 2: "#00007F", 3: "#009300", 4: "#FF0000",
+    5: "#7F0000", 6: "#9C009C", 7: "#FC7F00", 8: "#FFFF00", 9: "#00FC00",
+    10: "#009393", 11: "#00FFFF", 12: "#0000FC", 13: "#FF00FF", 14: "#7F7F7F",
+    15: "#D2D2D2", 16: "#470000", 17: "#472100", 18: "#474700", 19: "#004700",
+    20: "#00474F", 21: "#000047", 22: "#472147", 23: "#472F00", 24: "#004F00",
+    25: "#004F4F", 26: "#00004F", 27: "#4F004F", 28: "#4F4F00", 29: "#004F4F",
+    # extended colors simplified to basic 16 for Qt
+}
+
+def mirc_to_html(text: str) -> str:
+    """Convert mIRC color codes to HTML spans with approximate colors."""
+    def repl(match):
+        fg = int(match.group(1)) if match.group(1) else None
+        bg = int(match.group(2)) if match.group(2) else None
+        style = ""
+        if fg is not None and fg in MIRC_COLOR_MAP:
+            style += f"color:{MIRC_COLOR_MAP[fg]};"
+        if bg is not None and bg in MIRC_COLOR_MAP:
+            style += f"background-color:{MIRC_COLOR_MAP[bg]};"
+        if style:
+            return f'<span style="{style}">'
+        return ''
+    # First handle color codes
+    text = IRC_COLOR_RE.sub(repl, text)
+    # Handle other formatting
+    text = text.replace("\x02", "<b>").replace("\x0F", "</b></i></u><span>")
+    text = text.replace("\x1D", "<i>").replace("\x1F", "<u>")
+    text = text.replace("\x16", "")
+    # Close any open spans at reset
+    text = re.sub(r'\x03', '</span>', text)
+    return text
 
 def make_urls_clickable(text: str) -> str:
     def repl(match):
@@ -111,12 +147,8 @@ def make_urls_clickable(text: str) -> str:
         return f'<a href="{url}">{url}</a>'
     return IRC_URL_RE.sub(repl, text)
 
-IRC_URL_RE = re.compile(r'https?://[^\s\x00-\x1f\x7f<>"\']+')
-
-
 def _ts() -> str:
     return time.strftime("[%H:%M]")
-
 
 def load_history() -> List[dict]:
     try:
@@ -127,18 +159,15 @@ def load_history() -> List[dict]:
         pass
     return []
 
-
 def save_history(items: List[dict]) -> None:
     try:
         HISTORY_PATH.write_text(json.dumps(items[-20:], indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
 
-
 def parse_server_time(ts: str) -> str:
     try:
         from datetime import datetime, timezone
-
         s = ts.rstrip("Z")
         fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in s else "%Y-%m-%dT%H:%M:%S"
         dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).astimezone(tz=None)
@@ -146,10 +175,8 @@ def parse_server_time(ts: str) -> str:
     except Exception:
         return _ts()
 
-
 def strip_irc_formatting(text: str) -> str:
     return IRC_CTLS_RE.sub("", text)
-
 
 def _parse_irc_line(raw: str):
     if not raw:
@@ -207,7 +234,6 @@ def _parse_irc_line(raw: str):
     nick = prefix.split("!", 1)[0] if prefix else ""
     return cmd, nick, params, prefix, tags
 
-
 def _html_span(cls: str, text: str) -> str:
     escaped = html.escape(text)
     styles = {
@@ -220,25 +246,20 @@ def _html_span(cls: str, text: str) -> str:
         "statusmsg": "color:#c6d0e2;",
         "noticemsg": "color:#ff9ee8;",
         "topicmsg": "color:#65d6ff;",
+        "highlight": "color:#ff4444; font-weight:bold;",
     }
     style = styles.get(cls, "")
     if style:
         return f'<span style="{style}">{escaped}</span>'
     return f'<span>{escaped}</span>'
 
-
 def irc_inline_to_html(text: str) -> str:
-    text = html.escape(text)
-    text = text.replace("\x02", "<b>")
-    # Escape helper for color / reset / italic / underline / reverse is intentionally simple:
-    # the display focus here is on channel-level highlighting, not perfect IRC rendering.
-    text = text.replace("\x0F", "</b></i></u><span>")
-    text = text.replace("\x1D", "<i>")
-    text = text.replace("\x1F", "<u>")
-    text = text.replace("\x16", "")
-    text = re.sub(r"\x03(?:\d{1,2}(?:,\d{1,2})?)?", "", text)
+    """Improved formatting with mIRC color support."""
+    # First convert mIRC colors
+    text = mirc_to_html(text)
+    # Then basic bold/italic etc (already partially handled in mirc_to_html)
+    text = html.escape(text)  # safety
     return text
-
 
 def _network_key(server: str, port: int) -> str:
     return f"{server}:{port}"
@@ -253,7 +274,6 @@ def _normalize_windows(items: List[str]) -> List[str]:
             ordered.append(name)
             seen.add(name)
     return ordered
-
 
 
 class ChannelListModel(QAbstractListModel):
@@ -320,7 +340,7 @@ class ChannelListModel(QAbstractListModel):
             if name == self._current:
                 return QBrush(QColor("#8fd3ff"))
             if name in self._highlighted:
-                return QBrush(QColor("red"))
+                return QBrush(QColor("red"))  # Red for highlighted channels
 
         return None
 
@@ -383,6 +403,7 @@ class IRCClientThread(threading.Thread):
         self._pending_names: Dict[str, set] = {}
         self._last_pong = time.monotonic()
         self._reader_timeout = 500
+        self._typing_last_sent: Dict[str, float] = {}
 
     def emit(self, kind: str, **payload):
         payload["type"] = kind
@@ -427,7 +448,7 @@ class IRCClientThread(threading.Thread):
             return s.translate(str.maketrans(r"\[]", r"|{}"))
         return s.translate(str.maketrans(r"[\\]^", r"{|}~"))
 
-    def _is_chan(self, name: str) -> bool:
+    def _is_chan(self, name: str) -> str:
         chantypes = str(self._isupport.get("CHANTYPES", "#&"))
         return bool(name) and name[0] in chantypes
 
@@ -499,8 +520,6 @@ class IRCClientThread(threading.Thread):
                 continue
             try:
                 self.sock.sendall((line + "\r\n").encode("utf-8", errors="replace"))
-                if line.startswith("CAP ") or line.startswith("AUTHENTICATE ") or line.startswith("NICK ") or line.startswith("USER "):
-                    pass
             except Exception as exc:
                 self.emit("status", text=f"Send failed: {exc}")
 
@@ -835,11 +854,25 @@ class IRCClientThread(threading.Thread):
     def cmd_quit(self, reason: str = "Leaving"):
         self.disconnect(reason)
 
+    # Typing support
+    def send_typing(self, target: str, state: str = "active"):
+        if "message-tags" not in self._active_caps or ("draft/typing" not in self._active_caps and "typing" not in self._active_caps):
+            return
+        now = time.monotonic()
+        last = self._typing_last_sent.get(target, 0.0)
+        if now - last < 3.0 and state != "done":
+            return
+        self._typing_last_sent[target] = now
+        try:
+            self.send_tagged({"+typing": state}, f"TAGMSG {target}")
+        except Exception:
+            pass
+
 
 class IRCMainWindow(QMainWindow):
     _instances: List["IRCMainWindow"] = []
     def __init__(self):
-        super().__init__()  # MUST call parent __init__ FIRST
+        super().__init__()
         self.setWindowTitle("eye are see GUI")
         self.resize(1100, 720)
         self.eventq: queue.Queue = queue.Queue()
@@ -854,7 +887,7 @@ class IRCMainWindow(QMainWindow):
         self._joined_channels: set[str] = set()
         self._pending_autojoin: List[str] = []
         self._history = load_history()
-        self._completion_state: Optional[Dict] = None  # Track completion cycling
+        self._completion_state: Optional[Dict] = None
         self._presence_summaries: Dict[str, Dict[str, object]] = {}
         self._typing_state: Dict[str, set] = {}
         self._typing_last_sent: Dict[str, float] = {}
@@ -866,6 +899,11 @@ class IRCMainWindow(QMainWindow):
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self.poll_events)
         self._poll_timer.start(50)
+
+        # Typing timer for sending
+        self._typing_timer = QTimer(self)
+        self._typing_timer.setSingleShot(True)
+        self._typing_timer.timeout.connect(self._typing_pause_tick)
 
     def _build_ui(self):
         central = QWidget(self)
@@ -903,8 +941,9 @@ class IRCMainWindow(QMainWindow):
         self.btnConnect.clicked.connect(self.toggle_connection)
         self.btnNewWindow.clicked.connect(self._spawn_new_window)
 
-        for w in (self.txtServer, self.txtPort, self.txtNick, self.txtPW, self.btnConnect, self.btnNewWindow, self.cmbConnectionHistory):
+        for w in (self.txtServer, self.txtPort, self.txtNick, self.txtPW, self.btnConnect, self.cmbConnectionHistory):
             top.addWidget(w)
+        # New Window button moved to bottom right later via layout adjustment
 
         root.addWidget(self.frmLogin)
 
@@ -930,6 +969,7 @@ class IRCMainWindow(QMainWindow):
             ".statusmsg { color: #c6d0e2; }"
             ".noticemsg { color: #ff9ee8; }"
             ".topicmsg { color: #65d6ff; }"
+            ".highlight { color: #ff4444; font-weight: bold; }"
         )
 
         self.frmUserslist = QFrame()
@@ -952,24 +992,24 @@ class IRCMainWindow(QMainWindow):
 
         self.txtInput = QPlainTextEdit()
         self.txtInput.setPlaceholderText("Type a message or /command and press Enter or start typing a nick and press [TAB] to autocomplete")
-        
         self.txtInput.setFixedHeight(74)
         self.txtInput.installEventFilter(self)
         self.txtInput.textChanged.connect(self._on_input_changed)
-        self._typing_timer = QTimer(self)
-        self._typing_timer.setSingleShot(True)
-        self._typing_timer.timeout.connect(self._typing_pause_tick)
-        self.txtInput.setFocus()
         ch.addWidget(self.txtInput)
 
         root.addWidget(self.frmChatarea, 1)
 
+        # Bottom bar with status and New Window button on the right
+        bottom_bar = QHBoxLayout()
         self.lblStatus = QLabel("Status: Ready")
-        root.addWidget(self.lblStatus)
-        self._refresh_channel_list()
+        bottom_bar.addWidget(self.lblStatus, 1)
+        bottom_bar.addWidget(self.btnNewWindow)
+        bottom_widget = QWidget()
+        bottom_widget.setLayout(bottom_bar)
+        root.addWidget(bottom_widget)
 
         self._refresh_channel_list()
-
+        self._refresh_channel_list()
 
     def _spawn_new_window(self):
         try:
@@ -991,48 +1031,27 @@ class IRCMainWindow(QMainWindow):
     def _on_input_changed(self):
         target = self._typing_target()
         text = self._current_input_text()
-        if not self.worker or not target:
-            return
-        # Never send typing for slash commands.
-        if text.startswith("/"):
-            self._send_typing_state("done")
+        if not self.worker or not target or text.startswith("/"):
+            if self.worker:
+                self.worker.send_typing(target, "done")
             return
         if not text:
-            self._send_typing_state("done")
+            if self.worker:
+                self.worker.send_typing(target, "done")
             return
-        self._send_typing_state("active")
+        if self.worker:
+            self.worker.send_typing(target, "active")
         if self._typing_timer is not None:
             self._typing_timer.start(3000)
 
     def _typing_pause_tick(self):
         text = self._current_input_text()
-        if not text or text.startswith("/"):
-            self._send_typing_state("done")
-        else:
-            self._send_typing_state("paused")
-
-    def _send_typing_state(self, state: str):
-        if not self.worker:
-            return
-        if "message-tags" not in self.worker._active_caps:
-            return
-        if "draft/typing" not in self.worker._active_caps and "typing" not in self.worker._active_caps:
-            return
         target = self._typing_target()
-        now = time.monotonic()
-        last = self._typing_last_sent.get(target, 0.0)
-        # Throttle to every 3 seconds per target per IRCv3 typing spec.
-        if state == "active" and now - last < 3.0:
-            return
-        if state in ("paused", "done") and now - last < 3.0 and state != "done":
-            return
-        self._typing_last_sent[target] = now
-        if state == "done" and self._typing_timer is not None:
-            self._typing_timer.stop()
-        try:
-            self.worker.send_tagged({"+typing": state}, f"TAGMSG {target}")
-        except Exception:
-            pass
+        if self.worker:
+            if not text or text.startswith("/"):
+                self.worker.send_typing(target, "done")
+            else:
+                self.worker.send_typing(target, "paused")
 
     def _invalidate_presence_summary(self, channel: str):
         self._presence_summaries.pop(channel, None)
@@ -1154,7 +1173,6 @@ class IRCMainWindow(QMainWindow):
         self._append_channel_line('*status*', f'<div class="statusmsg">{_html_span("ts", _ts())} {html.escape(text)}</div>')
         self.textBrowser.moveCursor(QTextCursor.MoveOperation.End if hasattr(QTextCursor, "MoveOperation") else QTextCursor.End)
 
-    
     def _ordered_windows(self) -> List[str]:
         return _normalize_windows(self.open_windows)
 
@@ -1231,7 +1249,6 @@ class IRCMainWindow(QMainWindow):
         return sorted((u for u in users if u), key=str.lower)
 
     def _autocomplete_nick(self) -> bool:
-        """Autocomplete nickname with cycling support. Press Tab multiple times to cycle through matches."""
         cursor = self._current_input_cursor()
         if cursor is None or cursor.hasSelection():
             self._completion_state = None
@@ -1258,20 +1275,16 @@ class IRCMainWindow(QMainWindow):
             self._completion_state = None
             return False
 
-        # Find all matches for this token
         matches = [nick for nick in candidates if nick.lower().startswith(token.lower())]
         if not matches:
             self._completion_state = None
             return False
 
-        # Determine if we should cycle to the next match
         if (self._completion_state is not None and 
             self._completion_state.get('token') == token and
             self._completion_state.get('start') == start):
-            # Same token, same position — cycle to next match
             self._completion_state['index'] = (self._completion_state['index'] + 1) % len(matches)
         else:
-            # New token or position — start fresh
             self._completion_state = {
                 'token': token,
                 'start': start,
@@ -1281,7 +1294,6 @@ class IRCMainWindow(QMainWindow):
 
         match = self._completion_state['matches'][self._completion_state['index']]
         
-        # Add colon after first word (common IRC convention)
         if start == 0:
             replacement = match + ": "
         else:
@@ -1295,7 +1307,6 @@ class IRCMainWindow(QMainWindow):
             new_cursor.setPosition(start + len(replacement))
             self.txtInput.setTextCursor(new_cursor)
             
-            # Show hint about available matches
             if len(matches) > 1:
                 remaining = [m for i, m in enumerate(matches) if i != self._completion_state['index']]
                 hint = f"{match} [{self._completion_state['index'] + 1}/{len(matches)}]"
@@ -1339,7 +1350,7 @@ class IRCMainWindow(QMainWindow):
         port = self._ui_port()
         nick = self._ui_nick()
         pw = self._ui_password()
-        use_ssl = port == 6697 or port == 6697
+        use_ssl = port in (6697, 6697)
         self._pending_autojoin = list(dict.fromkeys(self._pending_autojoin))
         self.worker = IRCClientThread(server, port, nick, pw, use_ssl, self.outq, self.eventq)
         self.worker.start()
@@ -1397,7 +1408,7 @@ class IRCMainWindow(QMainWindow):
         if not text:
             return
         self.txtInput.clear()
-        self._completion_state = None  # Reset completion state on send
+        self._completion_state = None
         self._send_typing_state("done")
         target = self.current_target or DEFAULT_CHANNEL
         if text.startswith("/"):
@@ -1465,7 +1476,6 @@ class IRCMainWindow(QMainWindow):
         else:
             self._append_status(f"Unknown command: /{cmd}")
 
-
     def _update_remote_typing(self, channel: str, nick: str, state: str):
         if not channel or not nick or nick == self._ui_nick():
             return
@@ -1476,8 +1486,9 @@ class IRCMainWindow(QMainWindow):
         if state in ("active", "paused"):
             if nick not in current:
                 current.add(nick)
+                # Show typing only in status bar for current channel, not main window
                 if channel == self.current_target:
-                    self._append_channel_line(channel, f'<div>{_html_span("ts", _ts())} <span class="mentionmsg">{html.escape(nick)} is typing…</span></div>')
+                    self.lblStatus.setText(f"Status: {nick} is typing...")
                 else:
                     self._mark_highlight(channel, play_sound=False)
             return
@@ -1487,7 +1498,8 @@ class IRCMainWindow(QMainWindow):
 
     def _append_local_message(self, target: str, nick: str, text: str, self_msg: bool = False, action: bool = False):
         ts = _ts()
-        clean = make_urls_clickable(html.escape(strip_irc_formatting(text)))
+        # Support mIRC colors in local messages too
+        clean = make_urls_clickable(mirc_to_html(html.escape(strip_irc_formatting(text))))
         nick_html = _html_span("nick", nick)
         if action:
             line = f'<div>{_html_span("ts", ts)} <span class="actionmsg">* {nick_html} {clean}</span></div>'
@@ -1601,7 +1613,7 @@ class IRCMainWindow(QMainWindow):
                 self._append_channel_line(ev.get('channel', self.current_target), f'<div>{_html_span("ts", ev.get("ts", _ts()))} {html.escape(old)} is now known as {html.escape(new)}</div>')
             elif kind == "notice":
                 target = ev.get("target", "")
-                text = make_urls_clickable(html.escape(strip_irc_formatting(ev.get("text", ""))))
+                text = make_urls_clickable(mirc_to_html(html.escape(strip_irc_formatting(ev.get("text", "")))))
                 cls = "directmsg" if ev.get("direct") else "noticemsg"
                 channel = target if target != self._ui_nick() else ev.get('nick', self.current_target)
                 self._ensure_channel(channel)
@@ -1613,7 +1625,9 @@ class IRCMainWindow(QMainWindow):
                 target = ev.get("target", "")
                 is_direct = bool(ev.get("direct"))
                 display_target = ev.get("nick", target) if is_direct else target
-                text = make_urls_clickable(html.escape(strip_irc_formatting(ev.get("text", ""))))
+                # mIRC color support in incoming messages
+                raw_text = ev.get("text", "")
+                text = make_urls_clickable(mirc_to_html(html.escape(strip_irc_formatting(raw_text))))
                 ts = _html_span("ts", ev.get("ts", _ts()))
                 if ev.get("action"):
                     line = f'<div>{ts} <span class="actionmsg">* {nick} {text}</span></div>'
@@ -1628,8 +1642,10 @@ class IRCMainWindow(QMainWindow):
                 self._ensure_channel(display_target)
                 self._append_channel_line(display_target, line)
                 self._typing_state.get(display_target, set()).discard(ev.get("nick", ""))
+                # Highlight + sound only when NOT current channel
                 if (ev.get("mention") or is_direct) and display_target != self.current_target:
                     self._mark_highlight(display_target, play_sound=True)
+                # Colorful text for mentions (already in mentionmsg class)
             elif kind == "typing":
                 channel = ev.get("channel", "")
                 nick = ev.get("nick", "")
@@ -1640,6 +1656,14 @@ class IRCMainWindow(QMainWindow):
                 self.connected = False
                 self.btnConnect.setText("Connect")
                 self._append_status(ev.get("text", "Disconnected"))
+
+    def _send_typing_state(self, state: str):
+        if not self.worker:
+            return
+        target = self._typing_target()
+        if self.worker:
+            self.worker.send_typing(target, state)
+
 if BINDING is None:
     raise SystemExit("PySide6 / PyQt6 / PyQt5 is not installed. Install one of them to run this GUI.")
 
@@ -1649,15 +1673,3 @@ if __name__ == "__main__":
     win = IRCMainWindow()
     win.show()
     sys.exit(app.exec())
-
-"""
-todo
-store the channels I have already joined in the connnection, load whne clicking on recently connected button, per network
-highlight user with sounds and colorful text, sound only whne it is not the current channel
-make channel appear red until clicked when i am highlighted in that channel
-
-make quit join and part messages appear only in the channel where those users are in
-make quit part and joins appear as a resume of all the ones intead of adding a new line per each, modify th4e previous line, unless there have been new messages
-make a new window button that displays a new copy of hte window so I can connect to another network
-make it support the IRCv3 spec where you can see when people are typing and send when youa re typing too
-"""

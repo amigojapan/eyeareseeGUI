@@ -1,5 +1,14 @@
 [
   {
+    "server": "irc.hoshinet.org",
+    "port": 6697,
+    "nick": "amigojapan",
+    "channels": [
+      "#eyearesee",
+      "#the-tomodachi"
+    ]
+  },
+  {
     "server": "irc.libera.chat",
     "port": 6697,
     "nick": "amigojapan",
