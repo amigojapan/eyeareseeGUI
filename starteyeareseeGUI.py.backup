@@ -364,12 +364,12 @@ class ChannelListModel(QAbstractListModel):
             return name
 
         if role == Qt.ForegroundRole:
+            if name in self._highlighted:
+                return QBrush(QColor("red"))  
             if name == "*status*":
                 return QBrush(QColor("#8aa0b8"))
             if name == self._current:
                 return QBrush(QColor("#8fd3ff"))
-            if name in self._highlighted:
-                return QBrush(QColor("red"))  
 
         return None
 
@@ -885,13 +885,17 @@ class IRCClientThread(threading.Thread):
         self.disconnect(reason)
 
     def send_typing(self, target: str, state: str = "active"):
-        if "message-tags" not in self._active_caps or ("draft/typing" not in self._active_caps and "typing" not in self._active_caps):
+        if "message-tags" not in self._active_caps:
             return
+            
         now = time.monotonic()
         last = self._typing_last_sent.get(target, 0.0)
+        
         if now - last < 3.0 and state != "done":
             return
+            
         self._typing_last_sent[target] = now
+        
         try:
             self.send_tagged({"+typing": state}, f"TAGMSG {target}")
         except Exception:
@@ -981,6 +985,12 @@ class IRCMainWindow(QMainWindow):
         self._typing_last_sent: Dict[str, float] = {}
         self._typing_timer: Optional[QTimer] = None
         self._pending_self_parts: set[str] = set()
+        
+        # Input History State
+        self._input_history: List[str] = []
+        self._input_history_index: int = 0
+        self._current_typing_buffer: str = ""
+
         self._build_ui()
         self._apply_settings_ui()
         self._load_history_combo()
@@ -1018,9 +1028,14 @@ class IRCMainWindow(QMainWindow):
         self.txtNick.setFixedHeight(34)
         self.txtNick.setToolTip("Nick")
         self.txtNick.setPlaceholderText("Nick")
+        
         self.txtPW = QLineEdit("")
         self.txtPW.setPlaceholderText("password / NickServ")
         self.txtPW.setEchoMode(QLineEdit.EchoMode.Password if hasattr(QLineEdit, "EchoMode") else QLineEdit.Password)
+        
+        self.chkSSL = QCheckBox("SSL")
+        self.chkSSL.setChecked(True)
+        
         self.btnConnect = QPushButton("Connect")
         self.btnNewWindow = QPushButton("New Window")
         self.btnSettings = QPushButton("Settings")
@@ -1031,7 +1046,7 @@ class IRCMainWindow(QMainWindow):
         self.btnNewWindow.clicked.connect(self._spawn_new_window)
         self.btnSettings.clicked.connect(self._open_settings)
 
-        for w in (self.txtServer, self.txtPort, self.txtNick, self.txtPW, self.btnConnect, self.cmbConnectionHistory):
+        for w in (self.txtServer, self.txtPort, self.txtNick, self.txtPW, self.chkSSL, self.btnConnect, self.cmbConnectionHistory):
             top.addWidget(w)
 
         root.addWidget(self.frmLogin)
@@ -1243,6 +1258,11 @@ class IRCMainWindow(QMainWindow):
         self.txtServer.setPlainText(str(item.get("server", DEFAULT_SERVER)))
         self.txtPort.setPlainText(str(item.get("port", DEFAULT_PORT)))
         self.txtNick.setPlainText(str(item.get("nick", DEFAULT_NICK)))
+        
+        # Smart fallback: if use_ssl is missing from an old history file, check if port is 6697
+        fallback_ssl = (item.get("port", DEFAULT_PORT) == 6697)
+        self.chkSSL.setChecked(item.get("use_ssl", fallback_ssl))
+
         channels = [c for c in item.get("channels", []) if isinstance(c, str) and c]
         self._pending_autojoin = channels[:]
         self._joined_channels = set(channels)
@@ -1265,10 +1285,14 @@ class IRCMainWindow(QMainWindow):
             try:
                 return_keys = (Qt.Key.Key_Return, Qt.Key.Key_Enter)
                 tab_key = Qt.Key.Key_Tab
+                up_key = Qt.Key.Key_Up
+                down_key = Qt.Key.Key_Down
                 no_mods = Qt.KeyboardModifier.NoModifier if hasattr(Qt, "KeyboardModifier") else Qt.NoModifier
             except AttributeError:
                 return_keys = (Qt.Key_Return, Qt.Key_Enter)
                 tab_key = Qt.Key_Tab
+                up_key = Qt.Key_Up
+                down_key = Qt.Key_Down
                 no_mods = Qt.NoModifier
 
             if key in return_keys:
@@ -1283,6 +1307,31 @@ class IRCMainWindow(QMainWindow):
                 except Exception:
                     if self._autocomplete_nick():
                         return True
+                        
+            if key == up_key:
+                if self._input_history:
+                    if self._input_history_index == len(self._input_history):
+                        self._current_typing_buffer = self.txtInput.toPlainText()
+                    if self._input_history_index > 0:
+                        self._input_history_index -= 1
+                        self.txtInput.setPlainText(self._input_history[self._input_history_index])
+                        cursor = self.txtInput.textCursor()
+                        cursor.movePosition(QTextCursor.MoveOperation.End if hasattr(QTextCursor, "MoveOperation") else QTextCursor.End)
+                        self.txtInput.setTextCursor(cursor)
+                return True
+
+            if key == down_key:
+                if self._input_history_index < len(self._input_history):
+                    self._input_history_index += 1
+                    if self._input_history_index == len(self._input_history):
+                        self.txtInput.setPlainText(self._current_typing_buffer)
+                    else:
+                        self.txtInput.setPlainText(self._input_history[self._input_history_index])
+                    cursor = self.txtInput.textCursor()
+                    cursor.movePosition(QTextCursor.MoveOperation.End if hasattr(QTextCursor, "MoveOperation") else QTextCursor.End)
+                    self.txtInput.setTextCursor(cursor)
+                return True
+                
         return super().eventFilter(obj, event)
 
     def _append_status(self, text: str):
@@ -1297,6 +1346,7 @@ class IRCMainWindow(QMainWindow):
         server = self._ui_server()
         port = self._ui_port()
         nick = self._ui_nick()
+        use_ssl = self.chkSSL.isChecked()
         channels = sorted(ch for ch in self._joined_channels if ch)
         key = _network_key(server, port)
         updated = False
@@ -1307,12 +1357,13 @@ class IRCMainWindow(QMainWindow):
                     item["port"] = port
                     item["nick"] = nick
                     item["channels"] = channels
+                    item["use_ssl"] = use_ssl
                     updated = True
                     break
             except Exception:
                 continue
         if not updated:
-            self._history.insert(0, {"server": server, "port": port, "nick": nick, "channels": channels})
+            self._history.insert(0, {"server": server, "port": port, "nick": nick, "channels": channels, "use_ssl": use_ssl})
         save_history(self._history)
         self._load_history_combo()
 
@@ -1467,13 +1518,14 @@ class IRCMainWindow(QMainWindow):
         port = self._ui_port()
         nick = self._ui_nick()
         pw = self._ui_password()
-        use_ssl = port in (6697, 6697)
+        use_ssl = self.chkSSL.isChecked()
+        
         self._pending_autojoin = list(dict.fromkeys(self._pending_autojoin))
         self.worker = IRCClientThread(server, port, nick, pw, use_ssl, self.outq, self.eventq)
         self.worker.start()
         self.connected = True
         self.btnConnect.setText("Disconnect")
-        self._append_status(f"Connecting to {server}:{port} as {nick}")
+        self._append_status(f"Connecting to {server}:{port} as {nick} (SSL: {use_ssl})")
         self._persist_history_state()
 
     def _ensure_channel(self, name: str):
@@ -1489,8 +1541,12 @@ class IRCMainWindow(QMainWindow):
         self._users_model = model
 
     def _mark_highlight(self, channel: str, play_sound: bool = True) -> None:
-        if not channel or channel == self.current_target or channel == "*status*":
+        if not channel or channel == "*status*":
             return
+            
+        if channel == self.current_target and self.isActiveWindow():
+            return
+            
         self._highlighted_windows.add(channel)
         if play_sound:
             try:
@@ -1524,6 +1580,12 @@ class IRCMainWindow(QMainWindow):
         text = self._current_input_text()
         if not text:
             return
+            
+        if not self._input_history or self._input_history[-1] != text:
+            self._input_history.append(text)
+        self._input_history_index = len(self._input_history)
+        self._current_typing_buffer = ""
+        
         self.txtInput.clear()
         self._completion_state = None
         self._send_typing_state("done")
@@ -1555,7 +1617,7 @@ class IRCMainWindow(QMainWindow):
             if chan and chan[0] in "#&!+":
                 self._pending_self_parts.add(chan)
             self._close_window(chan, remove_saved=True)
-        elif cmd == "me":
+        elif cmd in ("me", "action", "describe"):
             if self.worker:
                 self._append_local_message(self.current_target or DEFAULT_CHANNEL, self._ui_nick(), arg, self_msg=True, action=True)
                 self.worker.cmd_me(self.current_target or DEFAULT_CHANNEL, arg)
@@ -1576,6 +1638,57 @@ class IRCMainWindow(QMainWindow):
         elif cmd == "nick":
             if self.worker and arg:
                 self.worker.cmd_nick(arg)
+        elif cmd == "who":
+            if self.worker and arg:
+                self.worker.cmd_raw(f"WHO {arg}")
+        elif cmd == "whois":
+            if self.worker and arg:
+                self.worker.cmd_raw(f"WHOIS {arg}")
+        elif cmd == "whowas":
+            if self.worker and arg:
+                self.worker.cmd_raw(f"WHOWAS {arg}")
+        elif cmd == "kick":
+            if self.worker and arg:
+                kparts = arg.split(None, 1)
+                if len(kparts) == 1:
+                    chan = self.current_target or DEFAULT_CHANNEL
+                    self.worker.cmd_raw(f"KICK {chan} {kparts[0]}")
+                else:
+                    target = kparts[0]
+                    if target.startswith(('#', '&', '!', '+')):
+                        self.worker.cmd_raw(f"KICK {target} {kparts[1]}")
+                    else:
+                        chan = self.current_target or DEFAULT_CHANNEL
+                        self.worker.cmd_raw(f"KICK {chan} {target} :{kparts[1]}")
+        elif cmd == "mode":
+            if self.worker and arg:
+                mparts = arg.split(None, 1)
+                first = mparts[0]
+                if first.startswith(('#', '&', '!', '+')) or (len(mparts) > 1 and first[0] not in '+-'):
+                    self.worker.cmd_raw(f"MODE {arg}")
+                else:
+                    self.worker.cmd_raw(f"MODE {self.current_target or DEFAULT_CHANNEL} {arg}")
+            elif self.worker:
+                self.worker.cmd_raw(f"MODE {self.current_target or DEFAULT_CHANNEL}")
+        elif cmd == "invite":
+            if self.worker and arg:
+                iparts = arg.split(None, 1)
+                if len(iparts) == 1:
+                    self.worker.cmd_raw(f"INVITE {iparts[0]} {self.current_target or DEFAULT_CHANNEL}")
+                else:
+                    self.worker.cmd_raw(f"INVITE {iparts[0]} {iparts[1]}")
+        elif cmd == "away":
+            if self.worker:
+                if arg:
+                    self.worker.cmd_raw(f"AWAY :{arg}")
+                else:
+                    self.worker.cmd_raw("AWAY")
+        elif cmd == "list":
+            if self.worker:
+                self.worker.cmd_raw(f"LIST {arg}" if arg else "LIST")
+        elif cmd == "names":
+            if self.worker:
+                self.worker.cmd_raw(f"NAMES {arg}" if arg else f"NAMES {self.current_target or DEFAULT_CHANNEL}")
         elif cmd == "raw":
             if self.worker and arg:
                 self.worker.cmd_raw(arg)
@@ -1590,6 +1703,16 @@ class IRCMainWindow(QMainWindow):
         elif cmd == "topic":
             if self.worker and arg:
                 self.worker.cmd_raw(f"TOPIC {self.current_target or DEFAULT_CHANNEL} :{arg}")
+        elif cmd == "knock":
+            if self.worker and arg:
+                kparts = arg.split(None, 1)
+                if len(kparts) == 1:
+                    self.worker.cmd_raw(f"KNOCK {kparts[0]}")
+                else:
+                    self.worker.cmd_raw(f"KNOCK {kparts[0]} :{kparts[1]}")
+        elif cmd == "setname":
+            if self.worker and arg:
+                self.worker.cmd_raw(f"SETNAME :{arg}")
         else:
             self._append_status(f"Unknown command: /{cmd}")
 

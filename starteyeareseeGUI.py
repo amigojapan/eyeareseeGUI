@@ -122,7 +122,9 @@ DEFAULT_SETTINGS = {
     "font_family": "monospace",
     "font_size": 12,
     "theme": "dark_teal.xml",
-    "highlight_on_mention": True
+    "highlight_on_mention": True,
+    "trust_all_ssl": False,
+    "server_password": ""
 }
 
 def load_settings() -> dict:
@@ -364,13 +366,10 @@ class ChannelListModel(QAbstractListModel):
             return name
 
         if role == Qt.ForegroundRole:
-            # 1. Highest priority: Red if highlighted (even if it's the current channel)
             if name in self._highlighted:
                 return QBrush(QColor("red"))  
-            # 2. Next priority: Grey for status
             if name == "*status*":
                 return QBrush(QColor("#8aa0b8"))
-            # 3. Lowest priority: Blue for current active channel
             if name == self._current:
                 return QBrush(QColor("#8fd3ff"))
 
@@ -405,13 +404,15 @@ class IRCClientThread(threading.Thread):
         "knock",
     )
 
-    def __init__(self, server: str, port: int, nick: str, password: str, use_ssl: bool, outq: queue.Queue, eventq: queue.Queue):
+    def __init__(self, server: str, port: int, nick: str, password: str, use_ssl: bool, outq: queue.Queue, eventq: queue.Queue, trust_all_ssl: bool = False, server_pass: str = ""):
         super().__init__(daemon=True)
         self.server = server
         self.port = port
         self.nick = nick
-        self.password = password
+        self.password = password # This is SASL / NickServ password[cite: 4]
+        self.server_pass = server_pass # This is IRC PASS for ZNC[cite: 4]
         self.use_ssl = use_ssl
+        self.trust_all_ssl = trust_all_ssl
         self.outq = outq
         self.eventq = eventq
         self.stop_event = threading.Event()
@@ -510,11 +511,19 @@ class IRCClientThread(threading.Thread):
         raw.settimeout(self._reader_timeout)
         if self.use_ssl:
             ctx = ssl.create_default_context()
+            if self.trust_all_ssl:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             self.sock = ctx.wrap_socket(raw, server_hostname=self.server)
             self.sock.settimeout(self._reader_timeout)
         else:
             self.sock = raw
+        
+        # SEND IRC PASS FOR ZNC BEFORE ANYTHING ELSE[cite: 4]
+        if self.server_pass:
+            self.send_raw(f"PASS {self.server_pass}")
+            
         self.send_raw("CAP LS 302")
         self.send_raw(f"NICK {self.nick}")
         self.send_raw(f"USER {self.nick} 0 * :{self.nick}")
@@ -888,21 +897,18 @@ class IRCClientThread(threading.Thread):
         self.disconnect(reason)
 
     def send_typing(self, target: str, state: str = "active"):
-        # As long as the network supports message-tags, it will route client-only (+ prefixed) tags.
         if "message-tags" not in self._active_caps:
             return
             
         now = time.monotonic()
         last = self._typing_last_sent.get(target, 0.0)
         
-        # Rate limit "active" and "paused" to once every 3 seconds to avoid flooding
         if now - last < 3.0 and state != "done":
             return
             
         self._typing_last_sent[target] = now
         
         try:
-            # Send the IRCv3 client-only typing tag via TAGMSG
             self.send_tagged({"+typing": state}, f"TAGMSG {target}")
         except Exception:
             pass
@@ -946,6 +952,19 @@ class SettingsDialog(QDialog):
         self.chk_highlight.setChecked(self.settings.get("highlight_on_mention", True))
         layout.addWidget(self.chk_highlight)
 
+        self.chk_trust_ssl = QCheckBox("Trust invalid/self-signed SSL certificates")
+        self.chk_trust_ssl.setChecked(self.settings.get("trust_all_ssl", False))
+        layout.addWidget(self.chk_trust_ssl)
+
+        # SERVER PASSWORD FIELD FOR ZNC[cite: 4]
+        server_pass_layout = QHBoxLayout()
+        server_pass_layout.addWidget(QLabel("Server Password (IRC PASS):"))
+        self.txtServerPass = QLineEdit(self.settings.get("server_password", ""))
+        self.txtServerPass.setPlaceholderText("username:password")
+        self.txtServerPass.setEchoMode(QLineEdit.EchoMode.Password if hasattr(QLineEdit, "EchoMode") else QLineEdit.Password)
+        server_pass_layout.addWidget(self.txtServerPass)
+        layout.addLayout(server_pass_layout)
+
         try:
             btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         except AttributeError:
@@ -964,6 +983,8 @@ class SettingsDialog(QDialog):
         self.settings["font_size"] = self.size_spin.value()
         self.settings["theme"] = "dark_teal.xml" if self.theme_combo.currentIndex() == 0 else "light_teal.xml"
         self.settings["highlight_on_mention"] = self.chk_highlight.isChecked()
+        self.settings["trust_all_ssl"] = self.chk_trust_ssl.isChecked()
+        self.settings["server_password"] = self.txtServerPass.text().strip() # Save IRC PASS[cite: 4]
         return self.settings
 
 class IRCMainWindow(QMainWindow):
@@ -991,6 +1012,12 @@ class IRCMainWindow(QMainWindow):
         self._typing_last_sent: Dict[str, float] = {}
         self._typing_timer: Optional[QTimer] = None
         self._pending_self_parts: set[str] = set()
+        
+        # Input History State
+        self._input_history: List[str] = []
+        self._input_history_index: int = 0
+        self._current_typing_buffer: str = ""
+
         self._build_ui()
         self._apply_settings_ui()
         self._load_history_combo()
@@ -1028,9 +1055,14 @@ class IRCMainWindow(QMainWindow):
         self.txtNick.setFixedHeight(34)
         self.txtNick.setToolTip("Nick")
         self.txtNick.setPlaceholderText("Nick")
+        
         self.txtPW = QLineEdit("")
         self.txtPW.setPlaceholderText("password / NickServ")
         self.txtPW.setEchoMode(QLineEdit.EchoMode.Password if hasattr(QLineEdit, "EchoMode") else QLineEdit.Password)
+        
+        self.chkSSL = QCheckBox("SSL")
+        self.chkSSL.setChecked(True)
+        
         self.btnConnect = QPushButton("Connect")
         self.btnNewWindow = QPushButton("New Window")
         self.btnSettings = QPushButton("Settings")
@@ -1041,7 +1073,7 @@ class IRCMainWindow(QMainWindow):
         self.btnNewWindow.clicked.connect(self._spawn_new_window)
         self.btnSettings.clicked.connect(self._open_settings)
 
-        for w in (self.txtServer, self.txtPort, self.txtNick, self.txtPW, self.btnConnect, self.cmbConnectionHistory):
+        for w in (self.txtServer, self.txtPort, self.txtNick, self.txtPW, self.chkSSL, self.btnConnect, self.cmbConnectionHistory):
             top.addWidget(w)
 
         root.addWidget(self.frmLogin)
@@ -1253,6 +1285,10 @@ class IRCMainWindow(QMainWindow):
         self.txtServer.setPlainText(str(item.get("server", DEFAULT_SERVER)))
         self.txtPort.setPlainText(str(item.get("port", DEFAULT_PORT)))
         self.txtNick.setPlainText(str(item.get("nick", DEFAULT_NICK)))
+        
+        fallback_ssl = (item.get("port", DEFAULT_PORT) == 6697)
+        self.chkSSL.setChecked(item.get("use_ssl", fallback_ssl))
+
         channels = [c for c in item.get("channels", []) if isinstance(c, str) and c]
         self._pending_autojoin = channels[:]
         self._joined_channels = set(channels)
@@ -1275,10 +1311,14 @@ class IRCMainWindow(QMainWindow):
             try:
                 return_keys = (Qt.Key.Key_Return, Qt.Key.Key_Enter)
                 tab_key = Qt.Key.Key_Tab
+                up_key = Qt.Key.Key_Up
+                down_key = Qt.Key.Key_Down
                 no_mods = Qt.KeyboardModifier.NoModifier if hasattr(Qt, "KeyboardModifier") else Qt.NoModifier
             except AttributeError:
                 return_keys = (Qt.Key_Return, Qt.Key_Enter)
                 tab_key = Qt.Key_Tab
+                up_key = Qt.Key_Up
+                down_key = Qt.Key_Down
                 no_mods = Qt.NoModifier
 
             if key in return_keys:
@@ -1293,6 +1333,31 @@ class IRCMainWindow(QMainWindow):
                 except Exception:
                     if self._autocomplete_nick():
                         return True
+                        
+            if key == up_key:
+                if self._input_history:
+                    if self._input_history_index == len(self._input_history):
+                        self._current_typing_buffer = self.txtInput.toPlainText()
+                    if self._input_history_index > 0:
+                        self._input_history_index -= 1
+                        self.txtInput.setPlainText(self._input_history[self._input_history_index])
+                        cursor = self.txtInput.textCursor()
+                        cursor.movePosition(QTextCursor.MoveOperation.End if hasattr(QTextCursor, "MoveOperation") else QTextCursor.End)
+                        self.txtInput.setTextCursor(cursor)
+                return True
+
+            if key == down_key:
+                if self._input_history_index < len(self._input_history):
+                    self._input_history_index += 1
+                    if self._input_history_index == len(self._input_history):
+                        self.txtInput.setPlainText(self._current_typing_buffer)
+                    else:
+                        self.txtInput.setPlainText(self._input_history[self._input_history_index])
+                    cursor = self.txtInput.textCursor()
+                    cursor.movePosition(QTextCursor.MoveOperation.End if hasattr(QTextCursor, "MoveOperation") else QTextCursor.End)
+                    self.txtInput.setTextCursor(cursor)
+                return True
+                
         return super().eventFilter(obj, event)
 
     def _append_status(self, text: str):
@@ -1307,6 +1372,7 @@ class IRCMainWindow(QMainWindow):
         server = self._ui_server()
         port = self._ui_port()
         nick = self._ui_nick()
+        use_ssl = self.chkSSL.isChecked()
         channels = sorted(ch for ch in self._joined_channels if ch)
         key = _network_key(server, port)
         updated = False
@@ -1317,12 +1383,13 @@ class IRCMainWindow(QMainWindow):
                     item["port"] = port
                     item["nick"] = nick
                     item["channels"] = channels
+                    item["use_ssl"] = use_ssl
                     updated = True
                     break
             except Exception:
                 continue
         if not updated:
-            self._history.insert(0, {"server": server, "port": port, "nick": nick, "channels": channels})
+            self._history.insert(0, {"server": server, "port": port, "nick": nick, "channels": channels, "use_ssl": use_ssl})
         save_history(self._history)
         self._load_history_combo()
 
@@ -1477,13 +1544,16 @@ class IRCMainWindow(QMainWindow):
         port = self._ui_port()
         nick = self._ui_nick()
         pw = self._ui_password()
-        use_ssl = port in (6697, 6697)
+        use_ssl = self.chkSSL.isChecked()
+        trust_ssl = self.settings.get("trust_all_ssl", False)
+        server_pass = self.settings.get("server_password", "") # IRC PASS[cite: 4]
+        
         self._pending_autojoin = list(dict.fromkeys(self._pending_autojoin))
-        self.worker = IRCClientThread(server, port, nick, pw, use_ssl, self.outq, self.eventq)
+        self.worker = IRCClientThread(server, port, nick, pw, use_ssl, self.outq, self.eventq, trust_all_ssl=trust_ssl, server_pass=server_pass)
         self.worker.start()
         self.connected = True
         self.btnConnect.setText("Disconnect")
-        self._append_status(f"Connecting to {server}:{port} as {nick}")
+        self._append_status(f"Connecting to {server}:{port} as {nick} (SSL: {use_ssl}, Trust Invalid: {trust_ssl})")
         self._persist_history_state()
 
     def _ensure_channel(self, name: str):
@@ -1502,7 +1572,6 @@ class IRCMainWindow(QMainWindow):
         if not channel or channel == "*status*":
             return
             
-        # Only abort the highlight if we are looking right at the channel AND the window is active
         if channel == self.current_target and self.isActiveWindow():
             return
             
@@ -1539,6 +1608,12 @@ class IRCMainWindow(QMainWindow):
         text = self._current_input_text()
         if not text:
             return
+            
+        if not self._input_history or self._input_history[-1] != text:
+            self._input_history.append(text)
+        self._input_history_index = len(self._input_history)
+        self._current_typing_buffer = ""
+        
         self.txtInput.clear()
         self._completion_state = None
         self._send_typing_state("done")
@@ -1570,7 +1645,7 @@ class IRCMainWindow(QMainWindow):
             if chan and chan[0] in "#&!+":
                 self._pending_self_parts.add(chan)
             self._close_window(chan, remove_saved=True)
-        elif cmd == "me":
+        elif cmd in ("me", "action", "describe"):
             if self.worker:
                 self._append_local_message(self.current_target or DEFAULT_CHANNEL, self._ui_nick(), arg, self_msg=True, action=True)
                 self.worker.cmd_me(self.current_target or DEFAULT_CHANNEL, arg)
@@ -1591,6 +1666,57 @@ class IRCMainWindow(QMainWindow):
         elif cmd == "nick":
             if self.worker and arg:
                 self.worker.cmd_nick(arg)
+        elif cmd == "who":
+            if self.worker and arg:
+                self.worker.cmd_raw(f"WHO {arg}")
+        elif cmd == "whois":
+            if self.worker and arg:
+                self.worker.cmd_raw(f"WHOIS {arg}")
+        elif cmd == "whowas":
+            if self.worker and arg:
+                self.worker.cmd_raw(f"WHOWAS {arg}")
+        elif cmd == "kick":
+            if self.worker and arg:
+                kparts = arg.split(None, 1)
+                if len(kparts) == 1:
+                    chan = self.current_target or DEFAULT_CHANNEL
+                    self.worker.cmd_raw(f"KICK {chan} {kparts[0]}")
+                else:
+                    target = kparts[0]
+                    if target.startswith(('#', '&', '!', '+')):
+                        self.worker.cmd_raw(f"KICK {target} {kparts[1]}")
+                    else:
+                        chan = self.current_target or DEFAULT_CHANNEL
+                        self.worker.cmd_raw(f"KICK {chan} {target} :{kparts[1]}")
+        elif cmd == "mode":
+            if self.worker and arg:
+                mparts = arg.split(None, 1)
+                first = mparts[0]
+                if first.startswith(('#', '&', '!', '+')) or (len(mparts) > 1 and first[0] not in '+-'):
+                    self.worker.cmd_raw(f"MODE {arg}")
+                else:
+                    self.worker.cmd_raw(f"MODE {self.current_target or DEFAULT_CHANNEL} {arg}")
+            elif self.worker:
+                self.worker.cmd_raw(f"MODE {self.current_target or DEFAULT_CHANNEL}")
+        elif cmd == "invite":
+            if self.worker and arg:
+                iparts = arg.split(None, 1)
+                if len(iparts) == 1:
+                    self.worker.cmd_raw(f"INVITE {iparts[0]} {self.current_target or DEFAULT_CHANNEL}")
+                else:
+                    self.worker.cmd_raw(f"INVITE {iparts[0]} {iparts[1]}")
+        elif cmd == "away":
+            if self.worker:
+                if arg:
+                    self.worker.cmd_raw(f"AWAY :{arg}")
+                else:
+                    self.worker.cmd_raw("AWAY")
+        elif cmd == "list":
+            if self.worker:
+                self.worker.cmd_raw(f"LIST {arg}" if arg else "LIST")
+        elif cmd == "names":
+            if self.worker:
+                self.worker.cmd_raw(f"NAMES {arg}" if arg else f"NAMES {self.current_target or DEFAULT_CHANNEL}")
         elif cmd == "raw":
             if self.worker and arg:
                 self.worker.cmd_raw(arg)
@@ -1605,6 +1731,16 @@ class IRCMainWindow(QMainWindow):
         elif cmd == "topic":
             if self.worker and arg:
                 self.worker.cmd_raw(f"TOPIC {self.current_target or DEFAULT_CHANNEL} :{arg}")
+        elif cmd == "knock":
+            if self.worker and arg:
+                kparts = arg.split(None, 1)
+                if len(kparts) == 1:
+                    self.worker.cmd_raw(f"KNOCK {kparts[0]}")
+                else:
+                    self.worker.cmd_raw(f"KNOCK {kparts[0]} :{kparts[1]}")
+        elif cmd == "setname":
+            if self.worker and arg:
+                self.worker.cmd_raw(f"SETNAME :{arg}")
         else:
             self._append_status(f"Unknown command: /{cmd}")
 
@@ -1807,6 +1943,3 @@ if __name__ == "__main__":
     win = IRCMainWindow()
     win.show()
     sys.exit(app.exec())
-
-    "highlight still does not work,"
-    "IRCv3 type detection does not seem ot be updating the other cliewnt, on the other side... tho it does work when the other client types"
