@@ -38,6 +38,11 @@ try:
         QVBoxLayout,
         QWidget,
         QInputDialog,
+        QFontComboBox,
+        QSpinBox,
+        QDialog,
+        QDialogButtonBox,
+        QCheckBox
     )
     BINDING = "PySide6"
 except Exception:
@@ -62,6 +67,11 @@ except Exception:
             QVBoxLayout,
             QWidget,
             QInputDialog,
+            QFontComboBox,
+            QSpinBox,
+            QDialog,
+            QDialogButtonBox,
+            QCheckBox
         )
         from PyQt6.QtCore import QStringListModel
         BINDING = "PyQt6"
@@ -87,6 +97,11 @@ except Exception:
                 QVBoxLayout,
                 QWidget,
                 QInputDialog,
+                QFontComboBox,
+                QSpinBox,
+                QDialog,
+                QDialogButtonBox,
+                QCheckBox
             )
             BINDING = "PyQt5"
         except Exception:
@@ -101,6 +116,29 @@ DEFAULT_CHANNEL = "#eyearesee"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 HISTORY_PATH = SCRIPT_DIR / "connection_history.json"
+SETTINGS_PATH = SCRIPT_DIR / "settings.json"
+
+DEFAULT_SETTINGS = {
+    "font_family": "monospace",
+    "font_size": 12,
+    "theme": "dark_teal.xml",
+    "highlight_on_mention": True
+}
+
+def load_settings() -> dict:
+    try:
+        if SETTINGS_PATH.exists():
+            data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            return {**DEFAULT_SETTINGS, **data}
+    except Exception:
+        pass
+    return DEFAULT_SETTINGS.copy()
+
+def save_settings(settings: dict) -> None:
+    try:
+        SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 # mIRC color support
 IRC_COLOR_RE = re.compile(r'\x03(\d{1,2})(?:,(\d{1,2}))?')
@@ -115,11 +153,9 @@ MIRC_COLOR_MAP = {
     15: "#D2D2D2", 16: "#470000", 17: "#472100", 18: "#474700", 19: "#004700",
     20: "#00474F", 21: "#000047", 22: "#472147", 23: "#472F00", 24: "#004F00",
     25: "#004F4F", 26: "#00004F", 27: "#4F004F", 28: "#4F4F00", 29: "#004F4F",
-    # extended colors simplified to basic 16 for Qt
 }
 
 def mirc_to_html(text: str) -> str:
-    """Convert mIRC color codes to HTML spans with approximate colors."""
     def repl(match):
         fg = int(match.group(1)) if match.group(1) else None
         bg = int(match.group(2)) if match.group(2) else None
@@ -131,13 +167,10 @@ def mirc_to_html(text: str) -> str:
         if style:
             return f'<span style="{style}">'
         return ''
-    # First handle color codes
     text = IRC_COLOR_RE.sub(repl, text)
-    # Handle other formatting
     text = text.replace("\x02", "<b>").replace("\x0F", "</b></i></u><span>")
     text = text.replace("\x1D", "<i>").replace("\x1F", "<u>")
     text = text.replace("\x16", "")
-    # Close any open spans at reset
     text = re.sub(r'\x03', '</span>', text)
     return text
 
@@ -254,11 +287,8 @@ def _html_span(cls: str, text: str) -> str:
     return f'<span>{escaped}</span>'
 
 def irc_inline_to_html(text: str) -> str:
-    """Improved formatting with mIRC color support."""
-    # First convert mIRC colors
     text = mirc_to_html(text)
-    # Then basic bold/italic etc (already partially handled in mirc_to_html)
-    text = html.escape(text)  # safety
+    text = html.escape(text)  
     return text
 
 def _network_key(server: str, port: int) -> str:
@@ -274,7 +304,6 @@ def _normalize_windows(items: List[str]) -> List[str]:
             ordered.append(name)
             seen.add(name)
     return ordered
-
 
 class ChannelListModel(QAbstractListModel):
     def __init__(self, items: Optional[List[str]] = None, parent=None):
@@ -335,14 +364,18 @@ class ChannelListModel(QAbstractListModel):
             return name
 
         if role == Qt.ForegroundRole:
+            # 1. Highest priority: Red if highlighted (even if it's the current channel)
+            if name in self._highlighted:
+                return QBrush(QColor("red"))  
+            # 2. Next priority: Grey for status
             if name == "*status*":
                 return QBrush(QColor("#8aa0b8"))
+            # 3. Lowest priority: Blue for current active channel
             if name == self._current:
                 return QBrush(QColor("#8fd3ff"))
-            if name in self._highlighted:
-                return QBrush(QColor("red"))  # Red for highlighted channels
 
         return None
+
 
 class IRCClientThread(threading.Thread):
 
@@ -854,25 +887,90 @@ class IRCClientThread(threading.Thread):
     def cmd_quit(self, reason: str = "Leaving"):
         self.disconnect(reason)
 
-    # Typing support
     def send_typing(self, target: str, state: str = "active"):
-        if "message-tags" not in self._active_caps or ("draft/typing" not in self._active_caps and "typing" not in self._active_caps):
+        # As long as the network supports message-tags, it will route client-only (+ prefixed) tags.
+        if "message-tags" not in self._active_caps:
             return
+            
         now = time.monotonic()
         last = self._typing_last_sent.get(target, 0.0)
+        
+        # Rate limit "active" and "paused" to once every 3 seconds to avoid flooding
         if now - last < 3.0 and state != "done":
             return
+            
         self._typing_last_sent[target] = now
+        
         try:
+            # Send the IRCv3 client-only typing tag via TAGMSG
             self.send_tagged({"+typing": state}, f"TAGMSG {target}")
         except Exception:
             pass
 
+class SettingsDialog(QDialog):
+    def __init__(self, current_settings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.settings = current_settings.copy()
+
+        layout = QVBoxLayout(self)
+
+        font_layout = QHBoxLayout()
+        font_layout.addWidget(QLabel("Font:"))
+        self.font_combo = QFontComboBox()
+        self.font_combo.setCurrentFont(QFont(self.settings.get("font_family", "monospace")))
+        font_layout.addWidget(self.font_combo)
+
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(6, 72)
+        self.size_spin.setValue(self.settings.get("font_size", 12))
+        font_layout.addWidget(self.size_spin)
+        layout.addLayout(font_layout)
+
+        self.preview_label = QLabel("Font Preview: The quick brown fox jumps over the lazy dog.")
+        layout.addWidget(self.preview_label)
+
+        self.font_combo.currentFontChanged.connect(self.update_preview)
+        self.size_spin.valueChanged.connect(self.update_preview)
+        self.update_preview()
+
+        theme_layout = QHBoxLayout()
+        theme_layout.addWidget(QLabel("Theme:"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["Dark Mode", "Light Mode"])
+        self.theme_combo.setCurrentIndex(0 if "dark" in self.settings.get("theme", "dark_teal.xml") else 1)
+        theme_layout.addWidget(self.theme_combo)
+        layout.addLayout(theme_layout)
+
+        self.chk_highlight = QCheckBox("Highlight list box on mention when window is inactive")
+        self.chk_highlight.setChecked(self.settings.get("highlight_on_mention", True))
+        layout.addWidget(self.chk_highlight)
+
+        try:
+            btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        except AttributeError:
+            btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def update_preview(self):
+        font = self.font_combo.currentFont()
+        font.setPointSize(self.size_spin.value())
+        self.preview_label.setFont(font)
+
+    def get_settings(self):
+        self.settings["font_family"] = self.font_combo.currentFont().family()
+        self.settings["font_size"] = self.size_spin.value()
+        self.settings["theme"] = "dark_teal.xml" if self.theme_combo.currentIndex() == 0 else "light_teal.xml"
+        self.settings["highlight_on_mention"] = self.chk_highlight.isChecked()
+        return self.settings
 
 class IRCMainWindow(QMainWindow):
     _instances: List["IRCMainWindow"] = []
     def __init__(self):
         super().__init__()
+        self.settings = load_settings()
         self.setWindowTitle("eye are see GUI")
         self.resize(1100, 720)
         self.eventq: queue.Queue = queue.Queue()
@@ -894,13 +992,13 @@ class IRCMainWindow(QMainWindow):
         self._typing_timer: Optional[QTimer] = None
         self._pending_self_parts: set[str] = set()
         self._build_ui()
+        self._apply_settings_ui()
         self._load_history_combo()
         self._append_status("Ready.")
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self.poll_events)
         self._poll_timer.start(50)
 
-        # Typing timer for sending
         self._typing_timer = QTimer(self)
         self._typing_timer.setSingleShot(True)
         self._typing_timer.timeout.connect(self._typing_pause_tick)
@@ -935,15 +1033,16 @@ class IRCMainWindow(QMainWindow):
         self.txtPW.setEchoMode(QLineEdit.EchoMode.Password if hasattr(QLineEdit, "EchoMode") else QLineEdit.Password)
         self.btnConnect = QPushButton("Connect")
         self.btnNewWindow = QPushButton("New Window")
+        self.btnSettings = QPushButton("Settings")
         self.cmbConnectionHistory = QComboBox()
         self.cmbConnectionHistory.setToolTip("Connection History")
         self.cmbConnectionHistory.currentIndexChanged.connect(self._apply_history_item)
         self.btnConnect.clicked.connect(self.toggle_connection)
         self.btnNewWindow.clicked.connect(self._spawn_new_window)
+        self.btnSettings.clicked.connect(self._open_settings)
 
         for w in (self.txtServer, self.txtPort, self.txtNick, self.txtPW, self.btnConnect, self.cmbConnectionHistory):
             top.addWidget(w)
-        # New Window button moved to bottom right later via layout adjustment
 
         root.addWidget(self.frmLogin)
 
@@ -958,19 +1057,6 @@ class IRCMainWindow(QMainWindow):
         self.textBrowser.setReadOnly(True)
         self.textBrowser.setOpenExternalLinks(True)
         self.textBrowser.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere if hasattr(QTextOption, "WrapMode") else QTextOption.WrapAtWordBoundaryOrAnywhere)
-        self.textBrowser.setStyleSheet(
-            "QTextBrowser { background: #111318; color: #f4f7fb; border: 1px solid #2b2f3a; font-family: monospace; font-size: 12pt; }"
-            ".ts { color: #8aa0b8; }"
-            ".nick { color: #8fd3ff; font-weight: 700; }"
-            ".selfmsg { background: #063b23; color: #7dffb2; font-weight: 800; padding: 0 4px; border-radius: 4px; }"
-            ".directmsg { background: #3a0b56; color: #ff77ff; font-weight: 800; padding: 0 4px; border-radius: 4px; }"
-            ".mentionmsg { background: #463b00; color: #ffe86a; font-weight: 800; padding: 0 4px; border-radius: 4px; }"
-            ".actionmsg { color: #64f0ff; font-style: italic; }"
-            ".statusmsg { color: #c6d0e2; }"
-            ".noticemsg { color: #ff9ee8; }"
-            ".topicmsg { color: #65d6ff; }"
-            ".highlight { color: #ff4444; font-weight: bold; }"
-        )
 
         self.frmUserslist = QFrame()
         self.frmUserslist.setFrameShape(QFrame.Shape.StyledPanel if hasattr(QFrame, "Shape") else QFrame.StyledPanel)
@@ -999,10 +1085,10 @@ class IRCMainWindow(QMainWindow):
 
         root.addWidget(self.frmChatarea, 1)
 
-        # Bottom bar with status and New Window button on the right
         bottom_bar = QHBoxLayout()
         self.lblStatus = QLabel("Status: Ready")
         bottom_bar.addWidget(self.lblStatus, 1)
+        bottom_bar.addWidget(self.btnSettings)
         bottom_bar.addWidget(self.btnNewWindow)
         bottom_widget = QWidget()
         bottom_widget.setLayout(bottom_bar)
@@ -1010,6 +1096,47 @@ class IRCMainWindow(QMainWindow):
 
         self._refresh_channel_list()
         self._refresh_channel_list()
+
+    def _apply_settings_ui(self):
+        ff = self.settings.get("font_family", "monospace")
+        fs = self.settings.get("font_size", 12)
+        self.textBrowser.setStyleSheet(
+            f"QTextBrowser {{ background: #111318; color: #f4f7fb; border: 1px solid #2b2f3a; font-family: '{ff}'; font-size: {fs}pt; }}"
+            ".ts { color: #8aa0b8; }"
+            ".nick { color: #8fd3ff; font-weight: 700; }"
+            ".selfmsg { background: #063b23; color: #7dffb2; font-weight: 800; padding: 0 4px; border-radius: 4px; }"
+            ".directmsg { background: #3a0b56; color: #ff77ff; font-weight: 800; padding: 0 4px; border-radius: 4px; }"
+            ".mentionmsg { background: #463b00; color: #ffe86a; font-weight: 800; padding: 0 4px; border-radius: 4px; }"
+            ".actionmsg { color: #64f0ff; font-style: italic; }"
+            ".statusmsg { color: #c6d0e2; }"
+            ".noticemsg { color: #ff9ee8; }"
+            ".topicmsg { color: #65d6ff; }"
+            ".highlight { color: #ff4444; font-weight: bold; }"
+        )
+        font = QFont(ff, fs)
+        self.txtInput.setFont(font)
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self.settings, self)
+        if dlg.exec():
+            new_settings = dlg.get_settings()
+            theme_changed = self.settings.get("theme") != new_settings.get("theme")
+            self.settings = new_settings
+            save_settings(self.settings)
+            self._apply_settings_ui()
+            if theme_changed:
+                apply_stylesheet(QApplication.instance(), theme=self.settings.get("theme", "dark_teal.xml"))
+
+    def changeEvent(self, event):
+        try:
+            if event.type() == QEvent.Type.ActivationChange:
+                if self.isActiveWindow():
+                    self._clear_highlight(self.current_target)
+        except AttributeError:
+            if event.type() == QEvent.ActivationChange:
+                if self.isActiveWindow():
+                    self._clear_highlight(self.current_target)
+        super().changeEvent(event)
 
     def _spawn_new_window(self):
         try:
@@ -1372,8 +1499,13 @@ class IRCMainWindow(QMainWindow):
         self._users_model = model
 
     def _mark_highlight(self, channel: str, play_sound: bool = True) -> None:
-        if not channel or channel == self.current_target or channel == "*status*":
+        if not channel or channel == "*status*":
             return
+            
+        # Only abort the highlight if we are looking right at the channel AND the window is active
+        if channel == self.current_target and self.isActiveWindow():
+            return
+            
         self._highlighted_windows.add(channel)
         if play_sound:
             try:
@@ -1486,7 +1618,6 @@ class IRCMainWindow(QMainWindow):
         if state in ("active", "paused"):
             if nick not in current:
                 current.add(nick)
-                # Show typing only in status bar for current channel, not main window
                 if channel == self.current_target:
                     self.lblStatus.setText(f"Status: {nick} is typing...")
                 else:
@@ -1498,8 +1629,7 @@ class IRCMainWindow(QMainWindow):
 
     def _append_local_message(self, target: str, nick: str, text: str, self_msg: bool = False, action: bool = False):
         ts = _ts()
-        # Support mIRC colors in local messages too
-        clean = make_urls_clickable(mirc_to_html(html.escape(strip_irc_formatting(text))))
+        clean = make_urls_clickable(html.escape(strip_irc_formatting(mirc_to_html(text))))
         nick_html = _html_span("nick", nick)
         if action:
             line = f'<div>{_html_span("ts", ts)} <span class="actionmsg">* {nick_html} {clean}</span></div>'
@@ -1625,7 +1755,7 @@ class IRCMainWindow(QMainWindow):
                 target = ev.get("target", "")
                 is_direct = bool(ev.get("direct"))
                 display_target = ev.get("nick", target) if is_direct else target
-                # mIRC color support in incoming messages
+                
                 raw_text = ev.get("text", "")
                 text = make_urls_clickable(mirc_to_html(html.escape(strip_irc_formatting(raw_text))))
                 ts = _html_span("ts", ev.get("ts", _ts()))
@@ -1642,10 +1772,13 @@ class IRCMainWindow(QMainWindow):
                 self._ensure_channel(display_target)
                 self._append_channel_line(display_target, line)
                 self._typing_state.get(display_target, set()).discard(ev.get("nick", ""))
-                # Highlight + sound only when NOT current channel
-                if (ev.get("mention") or is_direct) and display_target != self.current_target:
-                    self._mark_highlight(display_target, play_sound=True)
-                # Colorful text for mentions (already in mentionmsg class)
+                
+                is_active = self.isActiveWindow()
+                hl_on_mention = self.settings.get("highlight_on_mention", True)
+
+                if (ev.get("mention") or is_direct):
+                    if display_target != self.current_target or (not is_active and hl_on_mention):
+                        self._mark_highlight(display_target, play_sound=True)
             elif kind == "typing":
                 channel = ev.get("channel", "")
                 nick = ev.get("nick", "")
@@ -1669,7 +1802,11 @@ if BINDING is None:
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    apply_stylesheet(app, theme='dark_teal.xml')
+    initial_theme = load_settings().get("theme", "dark_teal.xml")
+    apply_stylesheet(app, theme=initial_theme)
     win = IRCMainWindow()
     win.show()
     sys.exit(app.exec())
+
+    "highlight still does not work,"
+    "IRCv3 type detection does not seem ot be updating the other cliewnt, on the other side... tho it does work when the other client types"
