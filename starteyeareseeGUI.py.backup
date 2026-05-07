@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-from PySide6.QtCore import QUrl
-from PySide6.QtMultimedia import QSoundEffect
+
 import base64
 import html
 import json
@@ -1559,7 +1558,6 @@ class IRCMainWindow(QMainWindow):
             self._highlighted_windows.discard(name)
             self.channel_model.set_highlighted(self._highlighted_windows)
 
-
     def _mark_highlight(self, display_target, play_sound=True):
             self._highlighted_windows.add(display_target)
             
@@ -1567,15 +1565,7 @@ class IRCMainWindow(QMainWindow):
             self._channels_model.set_highlighted(self._highlighted_windows)
             
             if play_sound:
-                self.ping_sound = QSoundEffect()
-                # Path to your wav file
-                self.ping_sound.setSource(QUrl.fromLocalFile("glissando.wav"))
-                self.ping_sound.setVolume(0.25)
-                if self.ping_sound.isLoaded():
-                    self.ping_sound.play()
-            
-            
-
+                pass # Keep your existing sound logic here
 
     def _clear_highlight(self, channel: str) -> None:
         if channel in self._highlighted_windows:
@@ -1948,7 +1938,6 @@ class IRCMainWindow(QMainWindow):
         target = self._typing_target()
         if self.worker:
             self.worker.send_typing(target, state)
-
 
 if BINDING is None:
     raise SystemExit("PySide6 / PyQt6 / PyQt5 is not installed. Install one of them to run this GUI.")
