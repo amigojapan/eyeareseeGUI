@@ -38,6 +38,9 @@ if pip install qt_material; then
     echo "✔ Installed qt_material"
 fi
 
+if pip install playsound; then
+    echo "✔ Installed playsound"
+fi
 
 echo ""
 echo "✅ Installation complete!"

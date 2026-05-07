@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-
+from PySide6.QtCore import QUrl
+from PySide6.QtMultimedia import QSoundEffect
 import base64
 import html
 import json
@@ -311,6 +312,7 @@ class ChannelListModel(QAbstractListModel):
         self._items: List[str] = _normalize_windows(items or [])
         self._current: str = "*status*"
         self._highlighted: set[str] = set()
+        self._highlighted_channels = set()
 
     def set_items(self, items: List[str]) -> None:
         self.beginResetModel()
@@ -351,29 +353,27 @@ class ChannelListModel(QAbstractListModel):
         return len(self._items)
 
     def data(self, index, role=Qt.DisplayRole):
-        if not index or not index.isValid():
+            if not index.isValid():
+                return None
+
+            channel_name = self._items[index.row()]
+
+            # 1. ALWAYS return the pure, unmodified channel name so your chat history loads
+            if role == Qt.DisplayRole:
+                return channel_name
+
+            # 2. Use Qt's icon role to draw a red square next to the name if highlighted
+            if role == Qt.DecorationRole:
+                if channel_name in self._highlighted:
+                    return QColor("red")
+
+            # 3. Fallback text color (kept just in case you ever disable qt_material)
+            if role == Qt.ForegroundRole:
+                if channel_name in self._highlighted:
+                    return QColor("red")
+
             return None
-
-        row = index.row()
-        if row < 0 or row >= len(self._items):
-            return None
-
-        name = self._items[row]
-
-        if role == Qt.DisplayRole:
-            return name
-
-        if role == Qt.ForegroundRole:
-            if name in self._highlighted:
-                return QBrush(QColor("red"))  
-            if name == "*status*":
-                return QBrush(QColor("#8aa0b8"))
-            if name == self._current:
-                return QBrush(QColor("#8fd3ff"))
-
-        return None
-
-
+        
 class IRCClientThread(threading.Thread):
 
     WANT_CAPS = (
@@ -1550,20 +1550,32 @@ class IRCMainWindow(QMainWindow):
         self.lstUsers.setModel(model)
         self._users_model = model
 
-    def _mark_highlight(self, channel: str, play_sound: bool = True) -> None:
-        if not channel or channel == "*status*":
-            return
+    def _switch_channel(self, name): # (Or whatever your method is named)
+        self.current_target = name
+        # ... your existing code ...
+
+        # Clear the highlight when the user opens the channel
+        if name in self._highlighted_windows:
+            self._highlighted_windows.discard(name)
+            self.channel_model.set_highlighted(self._highlighted_windows)
+
+
+    def _mark_highlight(self, display_target, play_sound=True):
+            self._highlighted_windows.add(display_target)
             
-        if channel == self.current_target and self.isActiveWindow():
-            return
+            # Updated variable name here:
+            self._channels_model.set_highlighted(self._highlighted_windows)
             
-        self._highlighted_windows.add(channel)
-        if play_sound:
-            try:
-                QApplication.beep()
-            except Exception:
-                pass
-        self._refresh_channel_list()
+            if play_sound:
+                self.ping_sound = QSoundEffect()
+                # Path to your wav file
+                self.ping_sound.setSource(QUrl.fromLocalFile("glissando.wav"))
+                self.ping_sound.setVolume(0.25)
+                if self.ping_sound.isLoaded():
+                    self.ping_sound.play()
+            
+            
+
 
     def _clear_highlight(self, channel: str) -> None:
         if channel in self._highlighted_windows:
@@ -1894,9 +1906,31 @@ class IRCMainWindow(QMainWindow):
                 is_active = self.isActiveWindow()
                 hl_on_mention = self.settings.get("highlight_on_mention", True)
 
-                if (ev.get("mention") or is_direct):
+                # 1. Extract the message text directly from the GUI event
+                #message_text = ev.get("text", "")
+                
+                # 2. Check if your nick is in the text
+                #is_mention = "amigojapan" in message_text
+                
+                
+                # 3. Add 'is_mention' to the trigger condition
+                #if (ev.get("mention") or is_mention or is_direct):
+                #   if display_target != self.current_target or (not is_active and hl_on_mention):
+                #        self._mark_highlight(display_target, play_sound=True)
+
+                # ... [KEEP ALL YOUR ORIGINAL CODE HERE THAT SHOWS THE MESSAGE] ...
+                
+                # ---> PASTE THIS AT THE VERY END OF THE MESSAGE BLOCK <---
+                is_active = self.isActiveWindow()
+                hl_on_mention = self.settings.get("highlight_on_mention", True)
+                message_text = ev.get("text", "")
+                is_mention = "amigojapan" in message_text
+
+                if (ev.get("mention") or is_mention or is_direct):
                     if display_target != self.current_target or (not is_active and hl_on_mention):
                         self._mark_highlight(display_target, play_sound=True)
+                        print("****DEBUG****")
+                # ---------------------------------------------------------
             elif kind == "typing":
                 channel = ev.get("channel", "")
                 nick = ev.get("nick", "")
@@ -1914,6 +1948,7 @@ class IRCMainWindow(QMainWindow):
         target = self._typing_target()
         if self.worker:
             self.worker.send_typing(target, state)
+
 
 if BINDING is None:
     raise SystemExit("PySide6 / PyQt6 / PyQt5 is not installed. Install one of them to run this GUI.")
