@@ -15,6 +15,10 @@ import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import sys
+from PySide6.QtCore import QUrl
+from PySide6.QtMultimedia import QSoundEffect
+from PySide6.QtWidgets import QApplication, QMainWindow, QPushButton
 
 
 try:
@@ -1012,6 +1016,22 @@ class IRCMainWindow(QMainWindow):
         self._typing_timer.setSingleShot(True)
         self._typing_timer.timeout.connect(self._typing_pause_tick)
 
+        # Initialize the sound effect player
+        self.effect = QSoundEffect()
+
+        # Load your local audio file (WAV format is best supported)
+        self.effect.setSource(QUrl.fromLocalFile("sound.wav"))
+
+        # Optional: Set configurations
+        self.effect.setVolume(0.75)  # Range from 0.0 to 1.0
+
+    def play_sound(self):
+        # Play the audio file
+        if self.effect.isLoaded():
+            self.effect.play()
+        else:
+            print("Audio file is still loading or could not be found.")
+
     def _build_ui(self):
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -1565,7 +1585,8 @@ class IRCMainWindow(QMainWindow):
             self._channels_model.set_highlighted(self._highlighted_windows)
             
             if play_sound:
-                pass # Keep your existing sound logic here
+                self.play_sound()
+                
 
     def _clear_highlight(self, channel: str) -> None:
         if channel in self._highlighted_windows:
