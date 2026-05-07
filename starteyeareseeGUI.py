@@ -1949,3 +1949,6 @@ if __name__ == "__main__":
     win = IRCMainWindow()
     win.show()
     sys.exit(app.exec())
+
+    "add sound"
+    "add saving passwords into the normal connections json file, so next time you open the client it has the password in the password field"
