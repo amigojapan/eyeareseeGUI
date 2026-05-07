@@ -122,9 +122,7 @@ DEFAULT_SETTINGS = {
     "font_family": "monospace",
     "font_size": 12,
     "theme": "dark_teal.xml",
-    "highlight_on_mention": True,
-    "trust_all_ssl": False,
-    "server_password": ""
+    "highlight_on_mention": True
 }
 
 def load_settings() -> dict:
@@ -313,6 +311,7 @@ class ChannelListModel(QAbstractListModel):
         self._items: List[str] = _normalize_windows(items or [])
         self._current: str = "*status*"
         self._highlighted: set[str] = set()
+        self._highlighted_channels = set()
 
     def set_items(self, items: List[str]) -> None:
         self.beginResetModel()
@@ -353,29 +352,27 @@ class ChannelListModel(QAbstractListModel):
         return len(self._items)
 
     def data(self, index, role=Qt.DisplayRole):
-        if not index or not index.isValid():
+            if not index.isValid():
+                return None
+
+            channel_name = self._items[index.row()]
+
+            # 1. ALWAYS return the pure, unmodified channel name so your chat history loads
+            if role == Qt.DisplayRole:
+                return channel_name
+
+            # 2. Use Qt's icon role to draw a red square next to the name if highlighted
+            if role == Qt.DecorationRole:
+                if channel_name in self._highlighted:
+                    return QColor("red")
+
+            # 3. Fallback text color (kept just in case you ever disable qt_material)
+            if role == Qt.ForegroundRole:
+                if channel_name in self._highlighted:
+                    return QColor("red")
+
             return None
-
-        row = index.row()
-        if row < 0 or row >= len(self._items):
-            return None
-
-        name = self._items[row]
-
-        if role == Qt.DisplayRole:
-            return name
-
-        if role == Qt.ForegroundRole:
-            if name in self._highlighted:
-                return QBrush(QColor("red"))  
-            if name == "*status*":
-                return QBrush(QColor("#8aa0b8"))
-            if name == self._current:
-                return QBrush(QColor("#8fd3ff"))
-
-        return None
-
-
+        
 class IRCClientThread(threading.Thread):
 
     WANT_CAPS = (
@@ -404,15 +401,13 @@ class IRCClientThread(threading.Thread):
         "knock",
     )
 
-    def __init__(self, server: str, port: int, nick: str, password: str, use_ssl: bool, outq: queue.Queue, eventq: queue.Queue, trust_all_ssl: bool = False, server_pass: str = ""):
+    def __init__(self, server: str, port: int, nick: str, password: str, use_ssl: bool, outq: queue.Queue, eventq: queue.Queue):
         super().__init__(daemon=True)
         self.server = server
         self.port = port
         self.nick = nick
-        self.password = password # This is SASL / NickServ password[cite: 4]
-        self.server_pass = server_pass # This is IRC PASS for ZNC[cite: 4]
+        self.password = password
         self.use_ssl = use_ssl
-        self.trust_all_ssl = trust_all_ssl
         self.outq = outq
         self.eventq = eventq
         self.stop_event = threading.Event()
@@ -511,18 +506,20 @@ class IRCClientThread(threading.Thread):
         raw.settimeout(self._reader_timeout)
         if self.use_ssl:
             ctx = ssl.create_default_context()
-            if self.trust_all_ssl:
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            # --- ZNC / Self-Signed Cert Fix ---
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            # ----------------------------------
             self.sock = ctx.wrap_socket(raw, server_hostname=self.server)
             self.sock.settimeout(self._reader_timeout)
         else:
             self.sock = raw
-        
-        # SEND IRC PASS FOR ZNC BEFORE ANYTHING ELSE[cite: 4]
-        if self.server_pass:
-            self.send_raw(f"PASS {self.server_pass}")
+            
+        # --- ZNC / Server Password Fix ---
+        if self.password:
+            self.send_raw(f"PASS {self.password}")
+        # ---------------------------------
             
         self.send_raw("CAP LS 302")
         self.send_raw(f"NICK {self.nick}")
@@ -952,19 +949,6 @@ class SettingsDialog(QDialog):
         self.chk_highlight.setChecked(self.settings.get("highlight_on_mention", True))
         layout.addWidget(self.chk_highlight)
 
-        self.chk_trust_ssl = QCheckBox("Trust invalid/self-signed SSL certificates")
-        self.chk_trust_ssl.setChecked(self.settings.get("trust_all_ssl", False))
-        layout.addWidget(self.chk_trust_ssl)
-
-        # SERVER PASSWORD FIELD FOR ZNC[cite: 4]
-        server_pass_layout = QHBoxLayout()
-        server_pass_layout.addWidget(QLabel("Server Password (IRC PASS):"))
-        self.txtServerPass = QLineEdit(self.settings.get("server_password", ""))
-        self.txtServerPass.setPlaceholderText("username:password")
-        self.txtServerPass.setEchoMode(QLineEdit.EchoMode.Password if hasattr(QLineEdit, "EchoMode") else QLineEdit.Password)
-        server_pass_layout.addWidget(self.txtServerPass)
-        layout.addLayout(server_pass_layout)
-
         try:
             btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         except AttributeError:
@@ -983,8 +967,6 @@ class SettingsDialog(QDialog):
         self.settings["font_size"] = self.size_spin.value()
         self.settings["theme"] = "dark_teal.xml" if self.theme_combo.currentIndex() == 0 else "light_teal.xml"
         self.settings["highlight_on_mention"] = self.chk_highlight.isChecked()
-        self.settings["trust_all_ssl"] = self.chk_trust_ssl.isChecked()
-        self.settings["server_password"] = self.txtServerPass.text().strip() # Save IRC PASS[cite: 4]
         return self.settings
 
 class IRCMainWindow(QMainWindow):
@@ -1286,6 +1268,7 @@ class IRCMainWindow(QMainWindow):
         self.txtPort.setPlainText(str(item.get("port", DEFAULT_PORT)))
         self.txtNick.setPlainText(str(item.get("nick", DEFAULT_NICK)))
         
+        # Smart fallback: if use_ssl is missing from an old history file, check if port is 6697
         fallback_ssl = (item.get("port", DEFAULT_PORT) == 6697)
         self.chkSSL.setChecked(item.get("use_ssl", fallback_ssl))
 
@@ -1545,15 +1528,13 @@ class IRCMainWindow(QMainWindow):
         nick = self._ui_nick()
         pw = self._ui_password()
         use_ssl = self.chkSSL.isChecked()
-        trust_ssl = self.settings.get("trust_all_ssl", False)
-        server_pass = self.settings.get("server_password", "") # IRC PASS[cite: 4]
         
         self._pending_autojoin = list(dict.fromkeys(self._pending_autojoin))
-        self.worker = IRCClientThread(server, port, nick, pw, use_ssl, self.outq, self.eventq, trust_all_ssl=trust_ssl, server_pass=server_pass)
+        self.worker = IRCClientThread(server, port, nick, pw, use_ssl, self.outq, self.eventq)
         self.worker.start()
         self.connected = True
         self.btnConnect.setText("Disconnect")
-        self._append_status(f"Connecting to {server}:{port} as {nick} (SSL: {use_ssl}, Trust Invalid: {trust_ssl})")
+        self._append_status(f"Connecting to {server}:{port} as {nick} (SSL: {use_ssl})")
         self._persist_history_state()
 
     def _ensure_channel(self, name: str):
@@ -1568,20 +1549,23 @@ class IRCMainWindow(QMainWindow):
         self.lstUsers.setModel(model)
         self._users_model = model
 
-    def _mark_highlight(self, channel: str, play_sound: bool = True) -> None:
-        if not channel or channel == "*status*":
-            return
+    def _switch_channel(self, name): # (Or whatever your method is named)
+        self.current_target = name
+        # ... your existing code ...
+
+        # Clear the highlight when the user opens the channel
+        if name in self._highlighted_windows:
+            self._highlighted_windows.discard(name)
+            self.channel_model.set_highlighted(self._highlighted_windows)
+
+    def _mark_highlight(self, display_target, play_sound=True):
+            self._highlighted_windows.add(display_target)
             
-        if channel == self.current_target and self.isActiveWindow():
-            return
+            # Updated variable name here:
+            self._channels_model.set_highlighted(self._highlighted_windows)
             
-        self._highlighted_windows.add(channel)
-        if play_sound:
-            try:
-                QApplication.beep()
-            except Exception:
-                pass
-        self._refresh_channel_list()
+            if play_sound:
+                pass # Keep your existing sound logic here
 
     def _clear_highlight(self, channel: str) -> None:
         if channel in self._highlighted_windows:
@@ -1912,9 +1896,31 @@ class IRCMainWindow(QMainWindow):
                 is_active = self.isActiveWindow()
                 hl_on_mention = self.settings.get("highlight_on_mention", True)
 
-                if (ev.get("mention") or is_direct):
+                # 1. Extract the message text directly from the GUI event
+                #message_text = ev.get("text", "")
+                
+                # 2. Check if your nick is in the text
+                #is_mention = "amigojapan" in message_text
+                
+                
+                # 3. Add 'is_mention' to the trigger condition
+                #if (ev.get("mention") or is_mention or is_direct):
+                #   if display_target != self.current_target or (not is_active and hl_on_mention):
+                #        self._mark_highlight(display_target, play_sound=True)
+
+                # ... [KEEP ALL YOUR ORIGINAL CODE HERE THAT SHOWS THE MESSAGE] ...
+                
+                # ---> PASTE THIS AT THE VERY END OF THE MESSAGE BLOCK <---
+                is_active = self.isActiveWindow()
+                hl_on_mention = self.settings.get("highlight_on_mention", True)
+                message_text = ev.get("text", "")
+                is_mention = "amigojapan" in message_text
+
+                if (ev.get("mention") or is_mention or is_direct):
                     if display_target != self.current_target or (not is_active and hl_on_mention):
                         self._mark_highlight(display_target, play_sound=True)
+                        print("****DEBUG****")
+                # ---------------------------------------------------------
             elif kind == "typing":
                 channel = ev.get("channel", "")
                 nick = ev.get("nick", "")

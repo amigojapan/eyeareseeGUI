@@ -508,10 +508,20 @@ class IRCClientThread(threading.Thread):
         if self.use_ssl:
             ctx = ssl.create_default_context()
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            # --- ZNC / Self-Signed Cert Fix ---
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            # ----------------------------------
             self.sock = ctx.wrap_socket(raw, server_hostname=self.server)
             self.sock.settimeout(self._reader_timeout)
         else:
             self.sock = raw
+            
+        # --- ZNC / Server Password Fix ---
+        if self.password:
+            self.send_raw(f"PASS {self.password}")
+        # ---------------------------------
+            
         self.send_raw("CAP LS 302")
         self.send_raw(f"NICK {self.nick}")
         self.send_raw(f"USER {self.nick} 0 * :{self.nick}")
