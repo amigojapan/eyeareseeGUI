@@ -1971,5 +1971,6 @@ if __name__ == "__main__":
     win.show()
     sys.exit(app.exec())
 
-    "add sound"
+    "(done)add sound"
+    "add option to mute sound in settings"
     "add saving passwords into the normal connections json file, so next time you open the client it has the password in the password field"
