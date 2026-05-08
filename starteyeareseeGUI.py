@@ -2015,7 +2015,7 @@ class IRCMainWindow(QMainWindow):
                 is_active = self.isActiveWindow()
                 hl_on_mention = self.settings.get("highlight_on_mention", True)
                 message_text = ev.get("text", "")
-                is_mention = True#"amigojapan" in message_text
+                is_mention = self._ui_nick().lower() in message_text.lower()
 
                 if (ev.get("mention") or is_mention or is_direct):
                     if display_target != self.current_target or (not is_active and hl_on_mention):
