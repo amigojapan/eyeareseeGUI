@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+DEFAULT_SETTINGS = {
+    "font_family": "monospace",
+    "font_size": 12,
+    "theme": "dark_teal.xml",
+    "highlight_on_mention": True,
+    "mute_sound": False  # <-- Add this line
+}
+
 
 import base64
 import html
@@ -19,7 +27,23 @@ import sys
 from PySide6.QtCore import QUrl
 from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtWidgets import QApplication, QMainWindow, QPushButton
+import hashlib
 
+def get_nick_color(nick: str) -> str:
+    # Strip any operator prefixes before hashing
+    clean_nick = nick.lstrip('~&@%+').lower()
+    
+    # Hash the nick and convert to an integer
+    hash_val = int(hashlib.md5(clean_nick.encode('utf-8')).hexdigest(), 16)
+    
+    # A list of readable colors for dark themes (adjust as needed)
+    colors = [
+        "#ff8a65", "#4fc3f7", "#81c784", "#fff176", 
+        "#ba68c8", "#ffb74d", "#64b5f6", "#aed581", 
+        "#f06292", "#4dd0e1", "#dce775", "#9575cd"
+    ]
+    
+    return colors[hash_val % len(colors)]
 
 try:
     from PySide6.QtCore import Qt, QEvent, QTimer, QThread, QStringListModel, QAbstractListModel, QModelIndex
@@ -271,11 +295,40 @@ def _parse_irc_line(raw: str):
     nick = prefix.split("!", 1)[0] if prefix else ""
     return cmd, nick, params, prefix, tags
 
-def _html_span(cls: str, text: str) -> str:
-    escaped = html.escape(text)
+def get_nick_from_line(line: str) -> str:
+    # Check if the line has a prefix (starts with ':')
+    if line.startswith(':'):
+        # Split by the first space to isolate the prefix: ":nickname!user@host"
+        prefix = line.split(' ', 1)[0]
+        
+        # Remove the leading colon
+        prefix = prefix[1:]
+        
+        # If there's an '!' in the prefix, the nick is everything before it
+        if '!' in prefix:
+            return prefix.split('!', 1)[0]
+        
+        # If there is no '!', the prefix is likely a server name, not a user
+        return prefix
+        
+    return "" # No prefix found
+
+def _html_span(kind: str, text: str) -> str:
+    escaped_text = html.escape(text)
+    
+    # 1. Handle nicks dynamically first
+    if kind == "nick":
+        # Strip away any brackets < > or operator prefixes just in case
+        clean_nick = text.strip('<>@+~&% ').lower()
+        
+        # Get the color (Make sure your get_nick_color function is still in the file!)
+        color = get_nick_color(clean_nick)
+        
+        return f'<span style="color:{color}; font-weight:700;">{escaped_text}</span>'
+        
+    # 2. Static styles for everything else
     styles = {
         "ts": "color:#8aa0b8;",
-        "nick": "color:#8fd3ff; font-weight:700;",
         "selfmsg": "background-color:#063b23; color:#7dffb2; font-weight:800; padding:0 5px; border-radius:4px;",
         "directmsg": "background-color:#3a0b56; color:#ff77ff; font-weight:800; padding:0 5px; border-radius:4px;",
         "mentionmsg": "background-color:#463b00; color:#ffe86a; font-weight:800; padding:0 5px; border-radius:4px;",
@@ -285,10 +338,9 @@ def _html_span(cls: str, text: str) -> str:
         "topicmsg": "color:#65d6ff;",
         "highlight": "color:#ff4444; font-weight:bold;",
     }
-    style = styles.get(cls, "")
-    if style:
-        return f'<span style="{style}">{escaped}</span>'
-    return f'<span>{escaped}</span>'
+    
+    style = styles.get(kind, "")
+    return f'<span style="{style}">{escaped_text}</span>'
 
 def irc_inline_to_html(text: str) -> str:
     text = mirc_to_html(text)
@@ -960,6 +1012,21 @@ class SettingsDialog(QDialog):
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
+        # Inside the SettingsDialog __init__
+        self.mute_sound_cb = QCheckBox("Mute Sound")
+        self.mute_sound_cb.setChecked(self.settings.get("mute_sound", False))
+        layout.addWidget(self.mute_sound_cb)
+    
+    # ADD THIS NEW METHOD HERE:
+    def accept(self):
+        # Save your custom settings
+        self.settings["mute_sound"] = self.mute_sound_cb.isChecked()
+        
+        # If there are other settings (like theme/font) being saved, 
+        # make sure their save logic is here too, or let the main window handle them.
+        
+        # Finally, call the built-in accept method to close the dialog properly
+        super().accept()
 
     def update_preview(self):
         font = self.font_combo.currentFont()
@@ -1028,7 +1095,8 @@ class IRCMainWindow(QMainWindow):
     def play_sound(self):
         # Play the audio file
         if self.effect.isLoaded():
-            self.effect.play()
+            if not load_settings().get("mute_sound", False):
+                self.effect.play()
         else:
             print("Audio file is still loading or could not be found.")
 
@@ -1541,6 +1609,18 @@ class IRCMainWindow(QMainWindow):
             self.connected = False
             self.btnConnect.setText("Connect")
             self._append_status("Disconnect requested")
+            # Where the connection history is constructed:
+            history_item = {
+                "server": self.server_input.text(),
+                "port": self.port_input.value(),
+                "nick": self.nick_input.text(),
+                "password": self.password_input.text(), # <-- Add this line
+                "ssl": self.ssl_cb.isChecked()
+            }
+
+            # When populating the fields from history on launch or dropdown select:
+            if "password" in history_item:
+                self.password_input.setText(history_item["password"])
             return
 
         server = self._ui_server()
@@ -1643,7 +1723,7 @@ class IRCMainWindow(QMainWindow):
                 self._joined_channels.add(arg)
                 self._persist_history_state()
                 self._select_channel(arg)
-        elif cmd == "part":
+        elif cmd == "part" or  cmd == "leave":
             chan = arg or self.current_target or DEFAULT_CHANNEL
             if self.worker:
                 self.worker.cmd_part(chan)
@@ -1935,13 +2015,42 @@ class IRCMainWindow(QMainWindow):
                 is_active = self.isActiveWindow()
                 hl_on_mention = self.settings.get("highlight_on_mention", True)
                 message_text = ev.get("text", "")
-                is_mention = "amigojapan" in message_text
+                is_mention = True#"amigojapan" in message_text
 
                 if (ev.get("mention") or is_mention or is_direct):
                     if display_target != self.current_target or (not is_active and hl_on_mention):
+                        # Extract the sender's nick and the message text from the event
+                        sender_nick = ev.get("nick", "")
+                        message_text = ev.get("text", "")
+
+                        # 1. Format the nickname using your new dynamic color logic
+                        formatted_nick = _html_span("nick", f"<{sender_nick}>") 
+
+                        # 2. Format the actual message text (usually just default text color)
+                        formatted_text = _html_span("text", message_text)
+
+                        # 3. Combine them and append to the chat window
+                        final_line = f"{formatted_nick}🔴 {formatted_text}"
+                        #text = "🔴 " + final_line
+                        # Existing code for highlight styling
+                        html_text = _html_span("text", text)
+                        self._append_message_to_channel(display_target, final_line)
+                        
+                        #missing timestamp in highlighted message next line
+                        self._append_message_to_channel("*status*", final_line)
+                        #self._append_message_to_channel(display_target, html_text)
                         self._mark_highlight(display_target, play_sound=True)
                         print("****DEBUG****")
                 # ---------------------------------------------------------
+                #is_mention = self.client and self.client.nick and (self.client.nick.lower() in text.lower())
+
+                if is_mention:
+                    # Prepend the red dot emoji before the message text
+                    text = "🔴 " + text 
+                    # Existing code for highlight styling
+                    html_text = _html_span("mentionmsg", text)
+                else:
+                    html_text = _html_span("text", text)
             elif kind == "typing":
                 channel = ev.get("channel", "")
                 nick = ev.get("nick", "")
@@ -1972,5 +2081,10 @@ if __name__ == "__main__":
     sys.exit(app.exec())
 
     "(done)add sound"
-    "add option to mute sound in settings"
     "add saving passwords into the normal connections json file, so next time you open the client it has the password in the password field"
+    "order operators on top of users list"
+    "have nicks of people have semi random colors"
+
+    "password is not being loded when a connection is selected"
+    "other person's nick missing and timestamp in highlighted message and status when adding new mention"
+    
