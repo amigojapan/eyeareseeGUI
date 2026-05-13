@@ -9,9 +9,12 @@ import logging
 import socket
 import subprocess
 import sys
+import threading
 import unicodedata
 import urllib.parse
 import urllib.request
+import hashlib
+import hmac
 import heapq
 import io
 import json
@@ -25,6 +28,12 @@ from collections import deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 from math import log2
 from typing import Optional, Dict, List, Tuple, Callable
+
+# =========================
+# CLI flags — parsed before any optional imports or install code runs
+# =========================
+_NO_AI:      bool = "--no-ai"      in sys.argv
+_NO_INSTALL: bool = "--no-install" in sys.argv
 
 # =========================
 # Anthropic (optional)
@@ -45,6 +54,20 @@ try:
 except ImportError:
     _openai_mod = None  # type: ignore
     OPENAI_AVAILABLE = False
+
+# =========================
+# cryptography (optional — needed for SASL ECDSA-NIST256P-CHALLENGE)
+# =========================
+try:
+    from cryptography.hazmat.primitives.asymmetric import ec as _ecdsa_ec
+    from cryptography.hazmat.primitives import hashes as _ecdsa_hashes
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key as _load_pem_private_key
+    CRYPTOGRAPHY_AVAILABLE = True
+except ImportError:
+    _ecdsa_ec = None            # type: ignore
+    _ecdsa_hashes = None        # type: ignore
+    _load_pem_private_key = None  # type: ignore
+    CRYPTOGRAPHY_AVAILABLE = False
 
 # =========================
 # Curses (Windows-aware)
@@ -76,7 +99,7 @@ except ModuleNotFoundError:
     try:
         import windows_curses  # type: ignore
     except ImportError:
-        if "--no-install" in sys.argv:
+        if _NO_INSTALL:
             sys.exit("windows-curses not found and --no-install is set. "
                      "Run without --no-install or: pip install windows-curses")
         print("windows-curses not found — installing...")
@@ -91,12 +114,19 @@ DEFAULT_PORT = 6697
 DEFAULT_NICK = "cfuser"
 DEFAULT_CHANNEL = "##anime"
 NICKSERV_PASSWORD = os.environ.get("IRC_NICKSERV_PASSWORD", "")
+# SASL mechanism and credential paths.  Supported mechanisms:
+#   PLAIN                    — password in IRC_NICKSERV_PASSWORD [default]
+#   SCRAM-SHA-256            — RFC-5802 SCRAM (password in IRC_NICKSERV_PASSWORD)
+#   EXTERNAL                 — TLS client certificate (IRC_SASL_CERT + IRC_SASL_KEY)
+#   ECDSA-NIST256P-CHALLENGE — EC challenge-response (IRC_SASL_KEY; needs 'cryptography' pkg)
+SASL_MECHANISM = os.environ.get("IRC_SASL_MECHANISM", "PLAIN").upper()
+SASL_CERT      = os.environ.get("IRC_SASL_CERT", "")   # path to PEM client certificate
+SASL_KEY       = os.environ.get("IRC_SASL_KEY", "")    # path to PEM private key
 
 MAX_MESSAGES = 500
 USER_HISTORY_WINDOW = 200
 AI_SUSPECT_THRESHOLD = 70
-# Disable all AI detection (--no-ai flag).  Models are never loaded when True.
-_NO_AI: bool = "--no-ai" in sys.argv
+# _NO_AI / _NO_INSTALL are defined early (before imports) — see top of file.
 # AI detection logging: enabled by default.  Set IRC_AI_LOG=0 to disable at startup.
 # Can also be toggled at runtime with /logtoggle.
 _ai_logging_enabled: bool = os.environ.get("IRC_AI_LOG", "1") not in ("0", "false", "no", "off")
@@ -106,14 +136,16 @@ _ai_logging_enabled: bool = os.environ.get("IRC_AI_LOG", "1") not in ("0", "fals
 _SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
 AI_LOG_PATH        = os.path.join(_SCRIPT_DIR, "ai_scores.log")
 INPUT_HISTORY_PATH = os.path.join(_SCRIPT_DIR, "irc_input_history.txt")
+IRC_CONFIG_PATH    = os.path.join(_SCRIPT_DIR, "irc_config.json")
 INPUT_HISTORY_MAX  = 500
 CHAT_LOG_DIR       = os.path.join(_SCRIPT_DIR, "chat_logs")
 CHAT_LOG_LOAD      = 500
-STS_POLICY_PATH    = os.path.join(_SCRIPT_DIR, "sts_policy.json")
 
 # AI provider keys
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
+DEEPSEEK_API_KEY  = os.environ.get("DEEPSEEK_API_KEY", "")
+GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
 # Ollama: local/offline LLM server.  Override with OLLAMA_URL env var if running elsewhere.
 OLLAMA_URL: str    = os.environ.get("OLLAMA_URL",    "http://127.0.0.1:11434")
 # llama.cpp: local server with OpenAI-compatible API.  Override with LLAMACPP_URL env var.
@@ -133,6 +165,12 @@ AI_MODELS: Dict[str, Dict[str, str]] = {
     "gpt4o":   {"provider": "openai",   "id": "gpt-4o",                     "label": "GPT-4o"},
     "gpt4":    {"provider": "openai",   "id": "gpt-4-turbo",                "label": "GPT-4 Turbo"},
     "gpt35":   {"provider": "openai",   "id": "gpt-3.5-turbo",              "label": "GPT-3.5 Turbo"},
+    # ── Cloud: DeepSeek ──────────────────────────────────────────────────
+    "deepseek": {"provider": "deepseek", "id": "deepseek-chat",     "label": "DeepSeek-V3"},
+    "dsr1":     {"provider": "deepseek", "id": "deepseek-reasoner", "label": "DeepSeek-R1"},
+    # ── Cloud: GitHub Copilot ────────────────────────────────────────────
+    "copilot":  {"provider": "copilot",  "id": "gpt-4o",            "label": "Copilot GPT-4o"},
+    "copilot-mini": {"provider": "copilot", "id": "gpt-4o-mini",    "label": "Copilot GPT-4o-mini"},
     # ── Local/offline: Ollama ─────────────────────────────────────────────
     "gemma":   {"provider": "ollama",   "id": "gemma3:4b",   "label": "Gemma 3 4B   (Ollama/offline)"},
     "llama3":  {"provider": "ollama",   "id": "llama3.2",    "label": "Llama 3.2    (Ollama/offline)"},
@@ -182,6 +220,25 @@ def _chat_log_path(window_name: str) -> str:
     # Collapse dot-sequences to prevent directory traversal (e.g. ".." → "_")
     safe = re.sub(r'\.{2,}', '_', safe) or "_"
     return os.path.join(CHAT_LOG_DIR, safe + ".log")
+
+def load_irc_config() -> dict:
+    """Return saved server/nick/channel config, or {} if none exists."""
+    try:
+        with open(IRC_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+def save_irc_config(cfg: dict) -> None:
+    """Persist all settings to irc_config.json."""
+    try:
+        with open(IRC_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError:
+        pass
 
 def load_input_history() -> List[str]:
     """Return up to INPUT_HISTORY_MAX lines, most-recent first."""
@@ -282,42 +339,139 @@ def irc_strip_formatting(text: str) -> str:
 # Python's len() and f-string alignment know nothing about this, so every
 # column calculation must go through these helpers instead.
 
+# Unicode zero-width / presentation constants
+_ZWJ  = '‍'   # ZERO WIDTH JOINER
+_VS15 = '︎'   # VARIATION SELECTOR-15 (text presentation)
+_VS16 = '️'   # VARIATION SELECTOR-16 (emoji presentation)
+
 def _char_width(ch: str) -> int:
-    """Terminal display width of a single character: 2 for wide/fullwidth, 1 otherwise."""
+    """Terminal display width of a single Unicode scalar value.
+
+    Returns 0 for combining marks, enclosing marks, and Unicode format
+    characters (categories Mn/Mc/Me/Cf — includes ZWJ U+200D and variation
+    selectors U+FE0E/U+FE0F).  Returns 2 for wide/fullwidth East-Asian
+    characters and for symbol/pictographic emoji in the SMP that Python's
+    unicodedata may classify as EAW 'N' (e.g. U+1F3F3 WHITE FLAG).
+    Returns 1 for everything else.
+
+    Call _next_cluster() when iterating over strings so that ZWJ sequences
+    are counted as one glyph instead of summing each component's width.
+    """
+    cat = unicodedata.category(ch)
+    if cat in ('Mn', 'Mc', 'Me', 'Cf'):
+        return 0
     eaw = unicodedata.east_asian_width(ch)
-    return 2 if eaw in ("W", "F") else 1
+    if eaw in ('W', 'F'):
+        return 2
+    # Some Symbol/Other code points in the emoji blocks are not classified 'W'
+    # by Python's unicodedata even though modern terminals display them as 2-wide.
+    # Cover the Supplementary Multilingual Plane emoji ranges explicitly.
+    if cat == 'So':
+        cp = ord(ch)
+        if 0x1F000 <= cp <= 0x1FAFF:   # Mahjong … Symbols & Pictographs Extended-A
+            return 2
+    return 1
+
+def _next_cluster(s: str, i: int) -> tuple:
+    """Consume one grapheme cluster from *s* starting at index *i*.
+
+    Returns (new_index, visual_width).  Handles:
+      • ZWJ sequences (multi-person emoji, flag sequences like 🏳️‍🌈)
+      • Regional Indicator pairs (🇺🇸 = U+1F1FA U+1F1F8) — two adjacent RIs
+        form one flag glyph; only the base character's width is counted
+      • VS15 / VS16 variation selectors
+      • Unicode combining / enclosing / format characters (Mn, Mc, Me, Cf)
+
+    The cluster's visual width equals that of its base character; all absorbed
+    code points contribute zero additional columns.
+    """
+    n    = len(s)
+    base = s[i]
+    w    = _char_width(base)
+    i   += 1
+
+    # Regional Indicator pair → single emoji flag (🇺🇸, 🇬🇧, …).
+    # Two adjacent RIs together form one glyph; absorb the second RI.
+    if 0x1F1E0 <= ord(base) <= 0x1F1FF:
+        if i < n and 0x1F1E0 <= ord(s[i]) <= 0x1F1FF:
+            i += 1
+        return i, w   # flag clusters carry no further modifiers
+
+    while i < n:
+        nc  = s[i]
+        cat = unicodedata.category(nc)
+        if nc == _ZWJ:
+            i += 1                          # absorb ZWJ itself
+            if i < n and unicodedata.category(s[i]) not in ('Mn', 'Mc', 'Me', 'Cf'):
+                i += 1                      # absorb the next base glyph
+            while i < n and s[i] in (_VS16, _VS15):
+                i += 1                      # absorb any trailing VS on that glyph
+        elif nc in (_VS16, _VS15):
+            i += 1
+        elif cat in ('Mn', 'Mc', 'Me', 'Cf'):
+            i += 1
+        else:
+            break
+    return i, w
 
 def _str_visual_width(s: str) -> int:
-    """Total terminal column width of *s*, counting CJK/wide chars as 2 columns."""
-    return sum(_char_width(c) for c in s)
+    """Total terminal column width of *s*.
+
+    Wide/fullwidth East-Asian chars count as 2 columns.  ZWJ sequences,
+    variation selectors, and combining marks are folded into their base
+    glyph and contribute no extra columns.
+    """
+    total = 0
+    i     = 0
+    n     = len(s)
+    while i < n:
+        i, w  = _next_cluster(s, i)
+        total += w
+    return total
 
 def _truncate_to_width(s: str, max_cols: int) -> str:
-    """Return the longest prefix of *s* that fits within *max_cols* terminal columns."""
+    """Return the longest prefix of *s* that fits within *max_cols* terminal columns.
+
+    Never splits a grapheme cluster (ZWJ sequence, combining mark, etc.).
+    """
     cols = 0
-    for i, ch in enumerate(s):
-        cw = _char_width(ch)
+    i    = 0
+    n    = len(s)
+    while i < n:
+        start    = i
+        i, cw    = _next_cluster(s, i)
         if cols + cw > max_cols:
-            return s[:i]
+            return s[:start]
         cols += cw
     return s
 
 def _skip_visual_cols(s: str, skip: int) -> str:
-    """Return the substring of *s* that starts at visual column *skip*."""
+    """Return the substring of *s* that starts at visual column *skip*.
+
+    Advances by grapheme cluster so ZWJ sequences are never split.
+    """
     if skip <= 0:
         return s
     col = 0
-    for i, ch in enumerate(s):
+    i   = 0
+    n   = len(s)
+    while i < n:
+        start    = i
+        i, cw    = _next_cluster(s, i)
         if col >= skip:
-            return s[i:]
-        col += _char_width(ch)
+            return s[start:]
+        col += cw
     return ""
 
 def _irc_visual_pos(line: str, max_visual: int) -> int:
     """Return the raw-string index at which the visual column count reaches *max_visual*.
-    IRC control codes are zero-width; CJK/fullwidth chars count as 2 columns."""
+
+    IRC control codes are zero-width.  Non-control characters are advanced
+    by grapheme cluster so that ZWJ sequences count as a single display cell.
+    """
     vis = 0
-    i = 0
-    n = len(line)
+    i   = 0
+    n   = len(line)
     while i < n and vis < max_visual:
         ch = line[i]
         if ch in ("\x02", "\x1D", "\x1F", "\x16", "\x0F"):
@@ -333,11 +487,11 @@ def _irc_visual_pos(line: str, max_visual: int) -> int:
                     if i < n and line[i].isdigit(): i += 1
                     else: break
         else:
-            cw = _char_width(ch)
+            ni, cw = _next_cluster(line, i)
             if vis + cw > max_visual:
-                break       # this char would overflow — stop before it
+                break                   # cluster would overflow — stop before it
             vis += cw
-            i += 1
+            i    = ni
     return i
 
 # =========================
@@ -437,28 +591,6 @@ def _parse_server_time(ts: str) -> str:
         return dt.strftime("[%H:%M]")
     except Exception:
         return time.strftime("[%H:%M]")
-
-
-# ── STS (Strict Transport Security) persistent policy store ───────────────────
-def _load_sts_policy() -> dict:
-    """Load persisted STS policies; discard expired entries."""
-    try:
-        with open(STS_POLICY_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        now = time.time()
-        return {h: p for h, p in data.items()
-                if p.get("expires", 0) == 0 or p.get("expires", 0) > now}
-    except Exception:
-        return {}
-
-def _save_sts_policy(policy: dict) -> None:
-    try:
-        with open(STS_POLICY_PATH, "w", encoding="utf-8") as f:
-            json.dump(policy, f, indent=2)
-    except Exception:
-        pass
-
-_STS_POLICY: dict = _load_sts_policy()  # hostname → {port, expires, preload}
 
 
 async def _translate_to_english(text: str) -> Optional[str]:
@@ -933,12 +1065,13 @@ def load_historical_suspects(threshold: int) -> list:
 # AI Detector
 # =========================
 AI_AVAILABLE = False
-try:
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification, GPT2LMHeadModel, GPT2TokenizerFast
-    import torch
-    AI_AVAILABLE = True
-except Exception:
-    AI_AVAILABLE = False
+if not _NO_AI:
+    try:
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification, GPT2LMHeadModel, GPT2TokenizerFast
+        import torch
+        AI_AVAILABLE = True
+    except Exception:
+        AI_AVAILABLE = False
 
 IRC_CASUAL_WORDS = frozenset({
     "lol", "lmao", "lmfao", "rofl", "haha", "hehe", "xd", "xdd",
@@ -991,6 +1124,20 @@ AI_TELL_PHRASES = frozenset({
     "navigating the", "landscape of", "realm of",
     "leverage", "synergize", "holistic approach",
     "robust solution", "empower", "cutting-edge",
+    # Deliberative / thinking-aloud phrases (Claude 3/4, GPT-4o)
+    "let me think through", "here's my thinking",
+    "to put it another way", "to be more specific",
+    "broadly speaking", "in practical terms",
+    "at a high level", "drill down into",
+    "the key takeaway", "the main takeaway",
+    "worth unpacking", "let me unpack",
+    "when it comes to", "in real-world terms",
+    # 2026 additions — newer stylistic tics across all frontier models
+    "i think it's worth", "one thing to consider",
+    "it depends on", "the short answer is",
+    "the long answer is", "to answer directly",
+    "to give you a direct answer", "what i'd say is",
+    "here's the thing:", "the thing is,",
 })
 
 # Phrases characteristic of Llama 2 / Llama 3 / Mistral / open-source LLMs
@@ -1036,6 +1183,18 @@ LLAMA_TELL_PHRASES = frozenset({
     "my understanding is", "based on my knowledge",
     "as of my last update", "as of my knowledge",
     "as of my training", "my response to this",
+    # Additional open-source LLM openers (Qwen, Gemma, Mistral, Phi)
+    "i can certainly help", "i can help you with",
+    "let me outline", "here's a quick overview",
+    "here's a quick summary", "to break it down",
+    "step by step:", "step-by-step guide",
+    "here's what i'd suggest", "happy to elaborate",
+    "glad you asked", "great, let me",
+    "to put it simply,", "simply put,",
+    # Qwen3 / DeepSeek thinking-mode bleed-through (internal CoT leaking)
+    "let me think step by step", "thinking step by step",
+    "let me reason through", "let me work through",
+    "so first, let me", "ok, so the question",
 })
 
 # Vocabulary LLMs reach for that humans rarely use in casual IRC chat
@@ -1067,7 +1226,11 @@ _BOT_OPENER_RE = re.compile(
     r"^(?:Sure[!,]?|Absolutely[!,]?|Certainly[!,]?|Of course[!,]?|"
     r"Great[!,]?|Gladly[!,]?|Happy to help[!,]?|I'?d be happy|"
     r"I'?d be glad|Let me|Here'?s |Here are |To answer|"
-    r"Of course[,!] I'?d|I can help|I'?ll help)",
+    r"Of course[,!] I'?d|I can help|I'?ll help|"
+    r"I can certainly|Allow me|Thanks for (?:asking|the question)|"
+    r"Good (?:question|point)[!,.]?|That'?s (?:a )?(?:great|good|interesting)|"
+    r"To (?:address|answer|respond to)|I'?ll (?:break|walk|explain|outline)|"
+    r"Step(?:\s+\d+)?[:.]\s*\w)",
     re.IGNORECASE,
 )
 
@@ -1263,6 +1426,9 @@ class EnsembleAIDetector:
         self._cls2_tok   = None
         self._device = "cpu"
         self._pred_cache: OrderedDict = OrderedDict()  # text → Dict[str,float], LRU
+        # predict_detailed runs on _ML_EXECUTOR (multiple worker threads), so
+        # OrderedDict mutations need a lock to keep the linked list consistent.
+        self._pred_cache_lock = threading.Lock()
 
         if disabled:
             return
@@ -1483,6 +1649,8 @@ class EnsembleAIDetector:
         """
         if self._gpt2_tok is None or self._gpt2_model is None or self._obs_model is None:
             return 0.0
+        if len(text.split()) < 5:
+            return 0.0
         try:
             enc = self._gpt2_tok(text, return_tensors="pt", truncation=True, max_length=128)
             enc = {k: v.to(self._device) for k, v in enc.items()}
@@ -1512,6 +1680,8 @@ class EnsembleAIDetector:
         If cls2 failed to load only cls1 is used.
         """
         scores: List[float] = []
+        if len(text.split()) < 5:
+            return 0.0
         try:
             enc = self._cls_tok(text, return_tensors="pt", truncation=True, max_length=128)
             enc = {k: v.to(self._device) for k, v in enc.items()}
@@ -1555,24 +1725,41 @@ class EnsembleAIDetector:
         if not text:
             return _zero
 
-        cached = self._pred_cache.get(text)
-        if cached is not None:
-            try:
-                self._pred_cache.move_to_end(text)
-            except KeyError:
-                pass  # evicted by a concurrent thread between get() and move_to_end()
-            return cached  # type: ignore[return-value]
+        with self._pred_cache_lock:
+            cached = self._pred_cache.get(text)
+            if cached is not None:
+                try:
+                    self._pred_cache.move_to_end(text)
+                except KeyError:
+                    pass
+                return cached  # type: ignore[return-value]
+
+        # Reasoning-model CoT leakage: <think>...</think> tags from Qwen3 / DeepSeek-R1
+        # bleeding into chat are unambiguous AI evidence — skip all other scoring.
+        if re.search(r'</?think\b', text, re.IGNORECASE):
+            _certain: Dict[str, float] = {
+                "prob": 1.0, "heu": 1.0, "llama": 1.0, "bino": 1.0, "cls": 1.0}
+            with self._pred_cache_lock:
+                if len(self._pred_cache) >= self._CACHE_MAX:
+                    self._pred_cache.popitem(last=False)
+                self._pred_cache[text] = _certain
+            return _certain
 
         llama = self.llama_pattern_score(text)
         heu   = self._heuristic_score(text)
         bino  = self._binoculars_score(text)
         cls   = self._classifier_score(text)
 
-        # Ensemble: classifiers are the strongest ML signals; heuristics now carry
-        # more weight than before because the Llama pattern layer is precise and
-        # low-FP on IRC traffic.  Binoculars is stable but misses some open-source
-        # LLMs, so its weight is trimmed slightly.
-        prob = max(0.0, min(1.0, 0.35 * bino + 0.35 * cls + 0.30 * heu))
+        # Adaptive ensemble: ML models are unreliable on short IRC messages
+        # (< 8 words) — weight heuristics much higher there.  For long text
+        # (>= 30 words) Binoculars and the classifiers become more trustworthy.
+        n_words = len(text.split())
+        if n_words < 8:
+            prob = max(0.0, min(1.0, 0.12 * bino + 0.13 * cls + 0.75 * heu))
+        elif n_words < 30:
+            prob = max(0.0, min(1.0, 0.35 * bino + 0.35 * cls + 0.30 * heu))
+        else:
+            prob = max(0.0, min(1.0, 0.38 * bino + 0.37 * cls + 0.25 * heu))
 
         # High-confidence override: unambiguous Llama structural output in short
         # IRC messages should score high even when ML signals are uncertain.
@@ -1582,9 +1769,10 @@ class EnsembleAIDetector:
         result: Dict[str, float] = {
             "prob": prob, "heu": heu, "llama": llama, "bino": bino, "cls": cls}
 
-        if len(self._pred_cache) >= self._CACHE_MAX:
-            self._pred_cache.popitem(last=False)   # O(1) FIFO eviction
-        self._pred_cache[text] = result
+        with self._pred_cache_lock:
+            if len(self._pred_cache) >= self._CACHE_MAX:
+                self._pred_cache.popitem(last=False)   # O(1) FIFO eviction
+            self._pred_cache[text] = result
         return result
 
     def predict_prob(self, text: str) -> float:
@@ -1685,10 +1873,10 @@ class ScoringEngine:
         )
 
     def score_user(self, user_state) -> int:
-        return min(99, user_state.total_msgs // 2)
+        return int(user_state.rolling_ai_likelihood())
 
     def score_message(self, msg_state, user_state) -> int:
-        return 50
+        return int(user_state.rolling_ai_likelihood())
 
 # =========================
 # UserState + ChatWindow
@@ -1696,7 +1884,7 @@ class ScoringEngine:
 class UserState:
     __slots__ = ("nick", "join_time", "last_msg_time", "msg_times", "msg_lengths",
                  "total_msgs", "ai_scores", "_rolling_sum", "_len_sum", "_time_sum",
-                 "is_confirmed_bot", "account", "realname")
+                 "is_confirmed_bot")
     def __init__(self, nick: str):
         self.nick = nick
         self.join_time = time.monotonic()
@@ -1709,8 +1897,6 @@ class UserState:
         self._len_sum:     int   = 0
         self._time_sum:    float = 0.0
         self.is_confirmed_bot: bool = False
-        self.account: str = ""    # services account (from account-tag / extended-join / ACCOUNT)
-        self.realname: str = ""   # real name (from extended-join / SETNAME)
 
     def record_message(self, msg: str, ai_score: Optional[int] = None) -> None:
         now = time.monotonic()
@@ -1761,26 +1947,38 @@ class ChatWindow:
         self.is_channel = is_channel
         self.server_id = server_id
         self.lines: deque = deque(maxlen=MAX_MESSAGES)
+        self._line_msgids: deque = deque(maxlen=MAX_MESSAGES)  # parallel msgid per line
+        self._msg_store: dict = {}   # {msgid: (nick, text_preview)} — for reply lookups
+        self._last_msgid: str = ""   # msgid of most recent incoming message
+        self._reactions: dict = {}   # {msgid: {emoji: [nick, ...]}}
+        self._unread_from: int = -1  # index of first unread line (-1 = none)
         self.wrapped_cache: List[str] = []
         self.url_map: Dict[int, str] = {}  # wrapped line index -> full URL
         self._wrap_dirty = True
         self._last_wrap_width = 0
         self.scroll_offset: int = 0  # 0 = pinned to bottom
         self._persist = True         # write new lines to disk
+        # Optional override for the on-disk log filename.  Defaults to
+        # self.name; used to disambiguate multiple windows that share a name
+        # across servers (e.g. each server's own *status* window).
+        self._log_name: str = ""
 
     def add_line(self, text: str, timestamp: bool = True,
-                 ts_str: Optional[str] = None) -> None:
+                 ts_str: Optional[str] = None, msgid: str = "") -> None:
         if timestamp:
             ts = ts_str if ts_str else time.strftime("[%H:%M]")
             text = f"{ts} {text}"
         self.lines.append(text)
+        self._line_msgids.append(msgid)
         self._wrap_dirty = True
         if self._persist:
-            append_chat_line(self.name, text)
+            append_chat_line(self._log_name or self.name, text)
 
 # Reuse one SSL context across all connections (parsing the CA bundle is expensive).
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.minimum_version = ssl.TLSVersion.TLSv1_2
+if SASL_MECHANISM == "EXTERNAL" and SASL_CERT and SASL_KEY:
+    _SSL_CTX.load_cert_chain(SASL_CERT, SASL_KEY)
 
 # =========================
 # IRCClient - FULL + CTCP
@@ -1807,13 +2005,20 @@ class IRCClient:
         self._active_caps: set = set()           # currently ACKed/enabled caps
         self._batch_buffer: dict = {}            # batch ref → [(cmd,nick,params,prefix,tags)]
         self._batch_types: dict = {}             # batch ref → batch type string
+        self._batch_params: dict = {}            # batch ref → original BATCH+ params (for multiline target)
         self._current_batch_is_replay: bool = False  # True while replaying chathistory batch
         self._monitor_nicks: set = set()         # nicks on MONITOR list
         self._chathistory_cap: str = ""          # "chathistory" or "draft/chathistory"
         self._replay_enabled: bool = False       # must be set True before /replay works
         self._label_seq: int = 0                 # monotonic label counter (labeled-response)
-        self._sent_labels: set = set()           # labels we sent, waiting for echo-confirm
-        self._cap_req_queue: list = []           # individual caps queued after a batch NAK
+        self._pending_labels: set = set()        # labels sent on outgoing msgs, awaiting echo
+        self._whox_seq: int = 1                  # rotating token for WHOX queries (1–999)
+        self._whox_tokens: dict = {}             # token → requested-fields string
+        self._names_to_status: set = set()       # channels whose 366 should be echoed to *status*
+        self._cap_req_queue: list = []           # individual caps queued after a CAP NAK
+        self._sasl_state: dict = {}              # per-mechanism state across AUTHENTICATE exchanges
+        self._auth_buffer: str = ""              # accumulates chunked AUTHENTICATE data (>400 chars)
+        self._network_announced: bool = False    # one-shot announce of NETWORK token
         # Send queue — all outbound data goes here; _run_writer flushes it with
         # flood-control rate limiting so the server never disconnects us for flooding.
         self._send_queue: asyncio.Queue = asyncio.Queue(maxsize=512)
@@ -1843,17 +2048,6 @@ class IRCClient:
 
     async def connect(self) -> None:
         proto = "SSL" if self.use_ssl else "plain"
-        # Enforce persisted STS policy: warn if we are about to connect in plain-text
-        # to a host that previously advertised Strict Transport Security.
-        if not self.use_ssl:
-            policy = _STS_POLICY.get(self.server)
-            if policy:
-                expires = policy.get("expires", 0)
-                if expires == 0 or expires > time.time():
-                    await self.ui_queue.put(("status",
-                        f"[STS] WARNING: {self.server} has a TLS-only policy "
-                        f"(port {policy.get('port', '6697')}).  "
-                        f"Use /server {self.server} {policy.get('port', '6697')} ssl"))
         await self.ui_queue.put(("status", f"Connecting to {self.server}:{self.port} ({proto})..."))
         try:
             # 30-second connect timeout prevents hangs on unreachable hosts.
@@ -1917,10 +2111,9 @@ class IRCClient:
         line = line.replace("\r", "").replace("\n", "").replace("\x00", "")
         if not line:
             return
-        # Tagged lines: IRCv3 allows up to 4096 bytes for the tag section plus
-        # 512 bytes for the message body (client→server total ~4608 bytes).
-        max_bytes = 4608 if line.startswith("@") else 510
-        encoded = line.encode("utf-8", "replace")[:max_bytes]
+        # IRC protocol maximum is 512 bytes including CRLF (RFC 1459 §2.3).
+        # Encode first so multi-byte UTF-8 chars are truncated on a byte boundary.
+        encoded = line.encode("utf-8", "replace")[:510]
         try:
             self._send_queue.put_nowait(encoded + b"\r\n")
         except asyncio.QueueFull:
@@ -2054,7 +2247,30 @@ class IRCClient:
         attempt = 0
         while self.running:
             self._identified = False
+            # Reset all per-connection state. Anything populated by
+            # the previous session (caps, ISUPPORT, batches,
+            # chathistory cap, ...) would otherwise leak into the
+            # new connection and produce subtle bugs (stale
+            # CASEMAPPING, dropped self-echoes from the old server,
+            # network name never re-announced, ...).
             self._cap_ls_caps.clear()
+            self._cap_ls_values.clear()
+            self._active_caps.clear()
+            self._isupport.clear()
+            self._batch_buffer.clear()
+            self._batch_types.clear()
+            self._batch_params.clear()
+            self._cap_req_queue.clear()
+            self._sasl_state.clear()
+            self._auth_buffer = ""
+            self._network_announced = False
+            self._current_msg_tags = {}
+            self._chathistory_cap = ""
+            self._current_batch_is_replay = False
+            self._label_seq = 0
+            self._pending_labels.clear()
+            self._whox_seq = 1
+            self._whox_tokens.clear()
             keepalive_task: Optional[asyncio.Task] = None
             writer_task:    Optional[asyncio.Task] = None
             try:
@@ -2116,7 +2332,10 @@ class IRCClient:
                     break
                 text = line.decode("utf-8", "ignore").rstrip("\r\n")
                 if text:
-                    await self.process_line(text)
+                    try:
+                        await self.process_line(text)
+                    except Exception as _line_exc:
+                        await self.ui_queue.put(("status", f"[err] line handler: {_line_exc}"))
         except Exception as e:
             await self.ui_queue.put(("status", f"Read error: {e}"))
         finally:
@@ -2158,18 +2377,28 @@ class IRCClient:
                     continue
                 if "=" in t:
                     k, v = t.split("=", 1)
-                    # Unescape IRCv3 tag escape sequences (backslash must be processed inline)
+                    # Unescape IRCv3 tag escape sequences in a single
+                    # left-to-right pass. A chain of .replace() calls
+                    # is order-dependent and can re-decode the bytes
+                    # produced by an earlier replacement (e.g. an input
+                    # containing \\: would be mis-decoded).
+                    # Per IRCv3:
+                    #     \: → ;   \s → space   \\ → \
+                    #     \r → CR  \n → LF
+                    #     unknown \X → X (drop the backslash)
+                    #     trailing lone \ → dropped
                     _out: list = []
                     _it = iter(v)
                     for _c in _it:
                         if _c == "\\":
                             _n = next(_it, "")
-                            if _n == ":":   _out.append(";")
-                            elif _n == "s": _out.append(" ")
+                            if   _n == ":":  _out.append(";")
+                            elif _n == "s":  _out.append(" ")
                             elif _n == "\\": _out.append("\\")
-                            elif _n == "r": _out.append("\r")
-                            elif _n == "n": _out.append("\n")
-                            else:           _out.append(_n)
+                            elif _n == "r":  _out.append("\r")
+                            elif _n == "n":  _out.append("\n")
+                            elif _n == "":   pass  # trailing \ — drop
+                            else:             _out.append(_n)
                         else:
                             _out.append(_c)
                     v = "".join(_out)
@@ -2206,10 +2435,12 @@ class IRCClient:
         self._current_msg_tags = tags
         # If this line carries a batch tag (and we're tracking that batch),
         # buffer it for later bulk dispatch instead of dispatching immediately.
-        batch_ref = tags.get("batch")
-        if batch_ref and batch_ref in self._batch_buffer:
-            self._batch_buffer[batch_ref].append((cmd, nick, params, prefix, tags))
-            return
+        # BATCH itself is never buffered — it controls the batch lifecycle.
+        if cmd != "BATCH":
+            batch_ref = tags.get("batch")
+            if batch_ref and batch_ref in self._batch_buffer:
+                self._batch_buffer[batch_ref].append((cmd, nick, params, prefix, tags))
+                return
         handler = self._irc_handlers.get(cmd)
         if handler:
             await handler(nick, params, prefix)
@@ -2232,12 +2463,8 @@ class IRCClient:
         "message-tags", "batch", "labeled-response", "invite-notify",
         "account-tag", "standard-replies", "setname",
         "chathistory", "draft/chathistory",
-        "monitor",
-        "cap-notify",
-        "draft/typing",
-        "draft/event-playback",
-        "draft/read-marker",
-        "knock",
+        "draft/multiline", "message-redaction", "read-marker",
+        "draft/account-registration",
     )
 
     async def _irc_cap(self, nick, params, prefix):
@@ -2263,29 +2490,40 @@ class IRCClient:
                 elif "draft/chathistory" in self._cap_ls_caps:
                     self._chathistory_cap = "draft/chathistory"
                 want = [c for c in self._WANT_CAPS if c in self._cap_ls_caps]
-                if "sasl" in self._cap_ls_caps and NICKSERV_PASSWORD:
-                    # Only request sasl if server supports PLAIN mechanism
-                    sasl_val = self._cap_ls_values.get("sasl", "")
-                    if not sasl_val or "PLAIN" in sasl_val.upper().split(","):
-                        want.append("sasl")
+                # If both std and draft chathistory are advertised, ask
+                # for only the std one — some servers NAK requests that
+                # name both variants.
+                if "chathistory" in want and "draft/chathistory" in want:
+                    want.remove("draft/chathistory")
+                _sasl_creds_ok = (
+                    SASL_MECHANISM == "EXTERNAL"
+                        and bool(SASL_CERT and SASL_KEY)
+                    or SASL_MECHANISM == "ECDSA-NIST256P-CHALLENGE"
+                        and bool(SASL_KEY)
+                    or bool(NICKSERV_PASSWORD)
+                )
+                if "sasl" in self._cap_ls_caps and _sasl_creds_ok:
+                    want.append("sasl")
                 self.send_raw(f"CAP REQ :{' '.join(want)}" if want else "CAP END")
                 self._cap_ls_caps.clear()
         elif subcmd == "ACK":
             acked = set((params[-1] if params else "").lower().split())
             self._active_caps |= acked
             if "sasl" in acked:
-                self.send_raw("AUTHENTICATE PLAIN")
+                self.send_raw(f"AUTHENTICATE {SASL_MECHANISM}")
             else:
-                self._flush_cap_req_queue()
+                self.send_raw("CAP END")
         elif subcmd == "NAK":
-            # Server rejected a batch REQ — retry each cap individually so we
-            # still get whichever subset it does support.
+            # Server rejected a batched REQ. Retry each cap
+            # individually so we still get whichever subset the
+            # server actually supports. Only when the retry queue
+            # drains do we fall through to CAP END (and only if
+            # SASL is not still in flight — its numeric handlers
+            # own CAP END themselves).
             nak_caps = (params[-1] if params else "").lower().split()
             if len(nak_caps) > 1:
                 self._cap_req_queue.extend(nak_caps)
-                self._flush_cap_req_queue()
-            else:
-                self._flush_cap_req_queue()  # move on to next queued REQ or END
+            self._flush_cap_req_queue()
         elif subcmd == "NEW":
             # Dynamic cap announcement — request any we want that we don't have yet.
             new_avail: dict = {}
@@ -2308,16 +2546,183 @@ class IRCClient:
             self._active_caps -= removed
             await self.ui_queue.put(("status", f"[cap] server withdrew: {' '.join(removed)}"))
 
+    # ------------------------------------------------------------------
+    # SASL helpers
+    # ------------------------------------------------------------------
+
+    def _send_authenticate(self, payload: str) -> None:
+        """Send AUTHENTICATE with 400-char chunking per IRCv3 SASL spec."""
+        if not payload:
+            self.send_raw("AUTHENTICATE +")
+            return
+        for i in range(0, len(payload), 400):
+            self.send_raw(f"AUTHENTICATE {payload[i:i+400]}")
+        if len(payload) % 400 == 0:
+            # Exact multiple — trailing empty chunk signals end of message.
+            self.send_raw("AUTHENTICATE +")
+
+    async def _sasl_plain(self, _challenge: str) -> None:
+        payload = base64.b64encode(
+            f"{self.nick}\0{self.nick}\0{NICKSERV_PASSWORD}".encode("utf-8")
+        ).decode()
+        self._send_authenticate(payload)
+
+    async def _sasl_external(self, _challenge: str) -> None:
+        # Empty authzid — server derives identity from TLS client-cert CN/SAN.
+        self._send_authenticate("")
+
+    async def _sasl_scram_sha256(self, server_data: str) -> None:
+        """SCRAM-SHA-256 (RFC 5802) state machine."""
+        step = self._sasl_state.get("step", 0)
+
+        if step == 0 and not NICKSERV_PASSWORD:
+            await self.ui_queue.put((
+                "status",
+                "[SASL] SCRAM-SHA-256 requires IRC_NICKSERV_PASSWORD — aborting"))
+            self.send_raw("AUTHENTICATE *")
+            self._sasl_state = {}
+            return
+
+        if step == 0:
+            # Server sent "+" — begin exchange with client-first-message.
+            cnonce = base64.b64encode(os.urandom(18)).decode()
+            # Escape '=' → '=3D' and ',' → '=2C' in username per spec.
+            safe_nick = self.nick.replace("=", "=3D").replace(",", "=2C")
+            cfm_bare = f"n={safe_nick},r={cnonce}"
+            cfm = f"n,,{cfm_bare}"
+            self._sasl_state = {"step": 1, "cnonce": cnonce, "cfm_bare": cfm_bare}
+            self._send_authenticate(base64.b64encode(cfm.encode("utf-8")).decode())
+
+        elif step == 1:
+            # Server sent server-first-message: r=…,s=…,i=…
+            if not server_data:
+                await self.ui_queue.put(("status", "[SASL] SCRAM: empty server-first — aborting"))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+                return
+            sfm = base64.b64decode(server_data).decode("utf-8")
+            sfm_parts: dict = {}
+            for part in sfm.split(","):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    sfm_parts[k] = v
+
+            r = sfm_parts.get("r", "")
+            s = sfm_parts.get("s", "")
+            i_str = sfm_parts.get("i", "4096")
+            cnonce = self._sasl_state["cnonce"]
+
+            if not r.startswith(cnonce):
+                await self.ui_queue.put(("status", "[SASL] SCRAM: server nonce mismatch — aborting"))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+                return
+
+            salt = base64.b64decode(s)
+            iterations = int(i_str)
+            pw = NICKSERV_PASSWORD.encode("utf-8")
+
+            salted_pw   = hashlib.pbkdf2_hmac("sha256", pw, salt, iterations)
+            client_key  = hmac.new(salted_pw, b"Client Key", hashlib.sha256).digest()
+            stored_key  = hashlib.sha256(client_key).digest()
+            server_key  = hmac.new(salted_pw, b"Server Key", hashlib.sha256).digest()
+
+            # GS2 header for no channel binding: "n,," → base64 = "biws"
+            cb = base64.b64encode(b"n,,").decode()
+            cfw_noproof = f"c={cb},r={r}"
+            auth_message = f"{self._sasl_state['cfm_bare']},{sfm},{cfw_noproof}"
+
+            client_sig   = hmac.new(stored_key, auth_message.encode("utf-8"), hashlib.sha256).digest()
+            client_proof = bytes(a ^ b for a, b in zip(client_key, client_sig))
+            server_sig   = hmac.new(server_key, auth_message.encode("utf-8"), hashlib.sha256).digest()
+
+            cfm_final = f"{cfw_noproof},p={base64.b64encode(client_proof).decode()}"
+            self._sasl_state = {
+                "step": 2,
+                "expected_server_sig": base64.b64encode(server_sig).decode(),
+            }
+            self._send_authenticate(base64.b64encode(cfm_final.encode("utf-8")).decode())
+
+        elif step == 2:
+            # Server-final-message (optional — server may go straight to 903).
+            if server_data:
+                try:
+                    sfinal = base64.b64decode(server_data).decode("utf-8")
+                    for part in sfinal.split(","):
+                        if part.startswith("v="):
+                            expected = self._sasl_state.get("expected_server_sig", "")
+                            if part[2:] != expected:
+                                await self.ui_queue.put(
+                                    ("status", "[SASL] SCRAM: server signature mismatch (MITM?)"))
+                            break
+                except Exception:
+                    pass
+            self._sasl_state = {}
+
+    async def _sasl_ecdsa(self, server_data: str) -> None:
+        """ECDSA-NIST256P-CHALLENGE state machine."""
+        step = self._sasl_state.get("step", 0)
+
+        if step == 0:
+            # Server sent "+" — send account name (nick).
+            self._sasl_state = {"step": 1}
+            self._send_authenticate(base64.b64encode(self.nick.encode("utf-8")).decode())
+
+        elif step == 1:
+            # Server sent the challenge to sign.
+            if not server_data:
+                await self.ui_queue.put(("status", "[SASL] ECDSA: empty challenge — aborting"))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+                return
+            if not CRYPTOGRAPHY_AVAILABLE:
+                await self.ui_queue.put((
+                    "status",
+                    "[SASL] ECDSA requires the 'cryptography' package — pip install cryptography",
+                ))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+                return
+            if not SASL_KEY:
+                await self.ui_queue.put(("status", "[SASL] ECDSA: IRC_SASL_KEY not set — aborting"))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+                return
+            try:
+                challenge_bytes = base64.b64decode(server_data)
+                with open(SASL_KEY, "rb") as _kf:
+                    private_key = _load_pem_private_key(_kf.read(), password=None)
+                # sign() hashes with SHA-256 internally before signing.
+                sig = private_key.sign(challenge_bytes, _ecdsa_ec.ECDSA(_ecdsa_hashes.SHA256()))
+                self._send_authenticate(base64.b64encode(sig).decode())
+                self._sasl_state = {}
+            except Exception as exc:
+                await self.ui_queue.put(("status", f"[SASL] ECDSA signing failed: {exc}"))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+
     async def _irc_authenticate(self, nick, params, prefix):
-        if params and params[0] == "+":
-            raw = f"{self.nick}\0{self.nick}\0{NICKSERV_PASSWORD}".encode()
-            payload = base64.b64encode(raw).decode()
-            # Chunk at 400 bytes; send "+" as final chunk if payload is exact multiple
-            chunk_size = 400
-            for i in range(0, len(payload), chunk_size):
-                self.send_raw(f"AUTHENTICATE {payload[i:i+chunk_size]}")
-            if len(payload) % chunk_size == 0:
-                self.send_raw("AUTHENTICATE +")
+        chunk = params[0] if params else "+"
+        # IRCv3 SASL: each chunk is ≤ 400 chars of base64; accumulate until
+        # we get a short chunk (or "+").  "+" alone means empty payload.
+        if len(chunk) == 400:
+            self._auth_buffer += chunk
+            return
+        server_data = self._auth_buffer + ("" if chunk == "+" else chunk)
+        self._auth_buffer = ""
+
+        mech = SASL_MECHANISM
+        if mech == "PLAIN":
+            await self._sasl_plain(server_data)
+        elif mech == "EXTERNAL":
+            await self._sasl_external(server_data)
+        elif mech == "SCRAM-SHA-256":
+            await self._sasl_scram_sha256(server_data)
+        elif mech == "ECDSA-NIST256P-CHALLENGE":
+            await self._sasl_ecdsa(server_data)
+        else:
+            await self.ui_queue.put(("status", f"[SASL] Unknown mechanism '{mech}' — aborting"))
+            self.send_raw("AUTHENTICATE *")
 
     async def _irc_sasl_ok(self, nick, params, prefix):  # 903
         await self.ui_queue.put(("status", "SASL authentication successful — ident set"))
@@ -2326,70 +2731,79 @@ class IRCClient:
 
     async def _irc_sasl_fail(self, nick, params, prefix):  # 904
         await self.ui_queue.put(("status", "SASL authentication failed — falling back to NickServ"))
+        # Abort the SASL session cleanly before ending CAP.
         self.send_raw("AUTHENTICATE *")
         self.send_raw("CAP END")
 
-    async def _irc_sasl_nicklocked(self, nick, params, prefix):  # 902
-        await self.ui_queue.put(("status", "SASL failed: nick is locked/registered — cannot authenticate"))
-        self.send_raw("AUTHENTICATE *")
-        self.send_raw("CAP END")
+    def _irc_lower(self, s: str) -> str:
+        r"""Casefold *s* per the server's CASEMAPPING ISUPPORT token.
 
-    async def _irc_sasl_aborted(self, nick, params, prefix):  # 906
-        await self.ui_queue.put(("status", "SASL authentication aborted"))
-        self.send_raw("CAP END")
-
-    async def _irc_sasl_alreadyauthed(self, nick, params, prefix):  # 907
-        await self.ui_queue.put(("status", "Already authenticated via SASL"))
-        self.send_raw("CAP END")
-
-    async def _irc_sasl_mechs(self, nick, params, prefix):  # 908
-        mechs = params[-1] if params else ""
-        await self.ui_queue.put(("status", f"SASL mechanisms available: {mechs}"))
-        if "PLAIN" not in mechs.upper().split(","):
-            await self.ui_queue.put(("status", "SASL PLAIN not supported — skipping SASL"))
-            self.send_raw("AUTHENTICATE *")
-            self.send_raw("CAP END")
+        The default is rfc1459, which folds {|}~ to []\^ in addition
+        to ASCII case. This matters for nick/channel equality checks:
+        plain str.lower() would treat 'Foo[' and 'foo{' as different.
+        """
+        mapping = self._isupport.get("CASEMAPPING", "rfc1459")
+        s = s.lower()
+        if mapping == "ascii":
+            return s
+        if mapping == "strict-rfc1459":
+            return s.translate(str.maketrans(r"\[]", r"|{}"))
+        # rfc1459 (default)
+        return s.translate(str.maketrans("[\\]^", "{|}~"))
 
     def _flush_cap_req_queue(self) -> None:
-        """Send the next queued cap REQ, or CAP END if the queue is empty."""
+        """Pop the next queued single-cap REQ, or send CAP END.
+
+        Used after CAP NAK to retry caps one at a time. SASL is
+        deliberately *not* flushed here: when SASL is in flight
+        the SASL numeric handlers (903/904) own CAP END, and we
+        must not race them.
+        """
         if self._cap_req_queue:
             cap = self._cap_req_queue.pop(0)
             self.send_raw(f"CAP REQ :{cap}")
-        else:
+        elif "sasl" not in self._active_caps:
             self.send_raw("CAP END")
 
-    def _ts(self) -> Optional[str]:
-        """Return a [HH:MM] string from the current message's server-time tag, or None."""
-        t = self._current_msg_tags.get("time")
-        return _parse_server_time(t) if t else None
-
     def _handle_sts(self, sts_value: str) -> None:
-        """Parse STS CAP value, persist the policy, and warn if not already on TLS."""
-        kv: dict = {}
+        """Parse Strict Transport Security CAP value and warn if TLS upgrade needed.
+
+        Per IRCv3 STS:
+          • duration=0 → server is *revoking* its policy. No warning.
+          • port must be a valid TCP port number; ignore garbage.
+        """
+        params: dict = {}
         for part in sts_value.split(","):
             if "=" in part:
                 k, v = part.split("=", 1)
-                kv[k] = v
+                params[k] = v
             else:
-                kv[part] = ""
-        port     = kv.get("port", "6697")
-        duration = int(kv.get("duration", "0") or "0")
-        preload  = "preload" in kv
-        # Persist so future plain-text connections to this host are caught.
-        _STS_POLICY[self.server] = {
-            "port": port,
-            "expires": (time.time() + duration) if duration else 0,
-            "preload": preload,
-        }
-        _save_sts_policy(_STS_POLICY)
-        if not self.use_ssl:
-            msg = (f"[STS] {self.server} requires TLS — reconnect with "
-                   f"/server {self.server} {port} ssl  "
-                   f"(policy: {duration}s{', preload' if preload else ''})")
-            try:
-                self.ui_queue.put_nowait(("status", msg))
-            except Exception:
-                pass
+                params[part] = ""
+        # Validate port — fall back to the IRC TLS default if missing/garbage.
+        port_str = params.get("port", "6697")
+        try:
+            port_int = int(port_str)
+            if not (1 <= port_int <= 65535):
+                raise ValueError
+            port = str(port_int)
+        except (TypeError, ValueError):
+            port = "6697"
+        # Validate duration — treat malformed as 0 (revoke).
+        try:
+            duration_int = int(params.get("duration", "0") or "0")
+        except (TypeError, ValueError):
+            duration_int = 0
+        if duration_int <= 0:
+            # Server is revoking its STS policy. Nothing to warn about.
+            return
+        preload = "preload" in params
+        msg = (f"[STS] Server requires TLS — reconnect with SSL on port {port} "
+               f"(policy duration={duration_int}s{', preload' if preload else ''}). "
+               f"Use /server {self.server} {port} ssl to upgrade.")
+        try:
+            self.ui_queue.put_nowait(("status", msg))
+        except Exception:
+            pass
 
     def send_tagged(self, tags: dict, line: str) -> None:
         """Prepend IRCv3 message tags to *line* when message-tags cap is active."""
@@ -2410,29 +2824,6 @@ class IRCClient:
         self._label_seq += 1
         return f"eyrc-{self._label_seq}"
 
-    def _irc_lower(self, s: str) -> str:
-        """Casefold a nick/channel according to the server's CASEMAPPING."""
-        mapping = self._isupport.get("CASEMAPPING", "rfc1459")
-        s = s.lower()
-        if mapping == "ascii":
-            return s
-        if mapping == "strict-rfc1459":
-            return s.translate(str.maketrans(r"\[]", r"|{}"))
-        # rfc1459 (default)
-        return s.translate(str.maketrans(r"[\\]^", r"{|}~"))
-
-    def _is_chan(self, name: str) -> bool:
-        """Return True if *name* looks like a channel per server's CHANTYPES."""
-        chantypes = self._isupport.get("CHANTYPES", "#&")
-        return bool(name) and name[0] in chantypes
-
-    def _get_prefix_chars(self) -> str:
-        """Return the mode-prefix characters from server's PREFIX ISUPPORT token."""
-        prefix = self._isupport.get("PREFIX", "(qaohv)~&@%+")
-        if ")" in prefix:
-            return prefix.split(")", 1)[1]
-        return "@+%&~!"
-
     async def _irc_logged_in(self, nick, params, prefix):  # 900
         account = params[2] if len(params) > 2 else "?"
         await self.ui_queue.put(("status", f"Logged in as {account}"))
@@ -2451,46 +2842,27 @@ class IRCClient:
     async def _irc_join(self, nick, params, prefix):
         if not params:
             return
-        channel  = params[0]
-        # extended-join: JOIN #channel account :realname (account="*" if not logged in)
-        account  = (params[1] if len(params) > 1 else "").strip()
-        realname = (params[2] if len(params) > 2 else "").strip()
-        if account == "*":
-            account = ""
-        ts_str = self._ts()
-        # Store account/realname in UserState for later reference
-        if nick != self.nick and (account or realname):
-            u = self.users.setdefault(nick, UserState(nick))
-            if account:
-                u.account = account
-            if realname:
-                u.realname = realname
-        await self.ui_queue.put(("join", nick, channel, ts_str, account, realname))
+        channel = params[0]
+        await self.ui_queue.put(("join", nick, channel))
         if nick == self.nick:
             await self.ui_queue.put(("self_join", channel))
-            if "draft/no-implicit-names" in self._active_caps:
-                self.send_raw(f"NAMES {channel}")
 
     async def _irc_part(self, nick, params, prefix):
         if params:
-            reason = params[1] if len(params) > 1 else ""
-            await self.ui_queue.put(("part", nick, params[0], self._ts(), reason))
+            await self.ui_queue.put(("part", nick, params[0]))
 
     async def _irc_kick(self, nick, params, prefix):
         if params:
             reason = params[-1] if len(params) > 2 else ""
             await self.ui_queue.put(("kick", nick, params[0],
-                                     params[1] if len(params) > 1 else "", reason,
-                                     self._ts()))
+                                     params[1] if len(params) > 1 else "", reason))
 
     async def _irc_topic_cmd(self, nick, params, prefix):
         if params:
-            await self.ui_queue.put(("topic", params[0],
-                                     params[-1] if len(params) > 1 else "",
-                                     self._ts(), nick))
+            await self.ui_queue.put(("topic", params[0], params[-1] if len(params) > 1 else ""))
 
     async def _irc_mode(self, nick, params, prefix):
-        await self.ui_queue.put(("mode", nick, params, self._ts()))
+        await self.ui_queue.put(("mode", nick, params))
 
     async def _irc_whois_reply(self, cmd_key: str, nick, params, prefix):
         w = params[1] if len(params) > 1 else "?"
@@ -2536,28 +2908,24 @@ class IRCClient:
     async def _irc_privmsg(self, nick, params, prefix):
         if len(params) < 2:
             return
-        # echo-message dedup: if labeled-response is active, only skip echoes that
-        # carry one of our own sent labels (so a second client using the same nick
-        # is not silently dropped). Without labeled-response fall back to nick match.
-        if nick == self.nick and not self._current_batch_is_replay:
-            label = self._current_msg_tags.get("label", "")
-            if "labeled-response" in self._active_caps:
-                # Only suppress echoes that carry one of our own sent labels
-                if label in self._sent_labels:
-                    self._sent_labels.discard(label)
-                    return
-                # No label or foreign label: from another session, show it
-            elif "echo-message" in self._active_caps:
-                # No labeled-response: suppress all self-echoes
-                return
+        tags = self._current_msg_tags
+        # labeled-response: if the echo carries a label we sent, discard it cleanly.
+        label = tags.get("label", "")
+        if label and label in self._pending_labels:
+            self._pending_labels.discard(label)
+            return
+        # Fallback nick-based echo dedup (when labeled-response not negotiated).
+        if (self._irc_lower(nick) == self._irc_lower(self.nick)
+                and not self._current_batch_is_replay):
+            return
         target = params[0]
         msg    = params[1]
-        tags   = self._current_msg_tags
         # server-time: prefer server-provided timestamp over local clock
         ts_str = _parse_server_time(tags["time"]) if "time" in tags else None
         # account-tag: sender's services account (if server advertises it)
-        account = tags.get("account", "")
-        msgid = tags.get("msgid", "")
+        account  = tags.get("account", "")
+        msgid    = tags.get("msgid", "")
+        reply_to = tags.get("+reply", "")
         is_replay = self._current_batch_is_replay
 
         # ACTION must be checked before the generic CTCP block — both use \x01
@@ -2566,44 +2934,33 @@ class IRCClient:
         if is_action:
             msg = msg[len("\x01ACTION "):-1]
         elif msg.startswith("\x01") and msg.endswith("\x01"):
-            # CTCP query — IRCv3 compliance:
-            # • Only respond to queries sent directly to us (not to channels)
-            # • Rate-limit via _ctcp_allowed (1 req/30 s per nick)
-            # • All replies use NOTICE (never PRIVMSG)
-            # • Strip any embedded \x01 from arguments before echoing
-            # • Log queries to *status* so the user can see them
-            ctcp_inner = msg[1:-1]
-            if len(ctcp_inner) > 512:        # reject overlong CTCP frames
-                return
-            ctcp_parts = ctcp_inner.split(" ", 1)
-            ctcp_cmd   = ctcp_parts[0].upper()
-            ctcp_args  = ctcp_parts[1] if len(ctcp_parts) > 1 else ""
-            # Ignore CTCPs sent to channels (RFC-mandated; prevents mass-replies)
-            if target.startswith("#"):
-                return
+            # Generic CTCP request
+            ctcp = msg[1:-1].split(" ", 1)
+            ctcp_cmd  = ctcp[0].upper()
+            ctcp_args = ctcp[1] if len(ctcp) > 1 else ""
             if not self._ctcp_allowed(nick):
                 return
-            ts_str = self._ts()
             if ctcp_cmd == "PING":
-                safe = ctcp_args.replace("\x01", "")[:200]
-                self.send_raw(f"NOTICE {nick} :\x01PING {safe}\x01")
+                safe_args = ctcp_args.replace("\x01", "")[:100]
+                self.send_raw(f"NOTICE {nick} :\x01PING {safe_args}\x01")
             elif ctcp_cmd == "VERSION":
-                self.send_raw(f"NOTICE {nick} :\x01VERSION eyearesee:4.0:Python/asyncio\x01")
-                await self.ui_queue.put(("status", f"-!- CTCP VERSION from {nick}", ts_str))
+                self.send_raw(f"NOTICE {nick} :\x01VERSION eyearesee IRC client v3.0\x01")
+                await self.ui_queue.put(("status", f"-!- CTCP VERSION from {nick}"))
             elif ctcp_cmd == "TIME":
-                t = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
-                self.send_raw(f"NOTICE {nick} :\x01TIME {t}\x01")
-                await self.ui_queue.put(("status", f"-!- CTCP TIME from {nick}", ts_str))
+                self.send_raw(
+                    f"NOTICE {nick} :\x01TIME "
+                    f"{time.strftime('%a, %d %b %Y %H:%M:%S %Z', time.localtime())}\x01")
+                await self.ui_queue.put(("status", f"-!- CTCP TIME from {nick}"))
             elif ctcp_cmd == "CLIENTINFO":
                 self.send_raw(
-                    f"NOTICE {nick} :\x01CLIENTINFO ACTION PING VERSION TIME CLIENTINFO USERINFO\x01")
+                    f"NOTICE {nick} :\x01CLIENTINFO "
+                    f"PING VERSION TIME CLIENTINFO USERINFO SOURCE FINGER\x01")
             elif ctcp_cmd == "USERINFO":
-                self.send_raw(f"NOTICE {nick} :\x01USERINFO {self.nick}:eyearesee IRC client\x01")
-            elif ctcp_cmd == "ACTION":
-                pass  # ACTION is a display token, not a query — ignore
-            else:
-                # Unknown CTCP: send ERR per IRCv3 CTCP spec
-                self.send_raw(f"NOTICE {nick} :\x01ERRMSG {ctcp_cmd} :Unknown CTCP command\x01")
+                self.send_raw(f"NOTICE {nick} :\x01USERINFO {self.nick} is using eyearesee\x01")
+            elif ctcp_cmd == "SOURCE":
+                self.send_raw(f"NOTICE {nick} :\x01SOURCE https://github.com (custom eyearesee)\x01")
+            elif ctcp_cmd == "FINGER":
+                self.send_raw(f"NOTICE {nick} :\x01FINGER No finger info\x01")
             return  # CTCP — never treat as normal message
 
         if nick not in self.users:
@@ -2619,7 +2976,7 @@ class IRCClient:
         # Extra fields: ts_str (server-time or None), account (account-tag or ""),
         #               is_replay (True when delivered inside a chathistory batch).
         await self.ui_queue.put(("msg", nick, target, msg, u_score, m_score, 0, 0,
-                                 is_action, ts_str, account, is_replay))
+                                 is_action, ts_str, account, is_replay, msgid, reply_to))
         if is_replay:
             return  # don't score replayed history; it's already been seen
         _t = asyncio.create_task(self._score_msg_bg(nick, target, msg, u_state, u_score, m_score))
@@ -2630,30 +2987,26 @@ class IRCClient:
         new_nick = params[0] if params else ""
         if nick == self.nick:
             self.nick = new_nick
+            # If we reclaimed our desired nick, stop the recovery loop.
             if new_nick == self._desired_nick:
                 if self._nick_reclaim_task and not self._nick_reclaim_task.done():
                     self._nick_reclaim_task.cancel()
                     await self.ui_queue.put(("status", f"Reclaimed nick {new_nick}"))
-        # Transfer user state so scoring history survives the nick change
-        if nick in self.users:
-            self.users[new_nick] = self.users.pop(nick)
-            self.users[new_nick].nick = new_nick
-        await self.ui_queue.put(("nick_change", nick, new_nick, self._ts()))
+        await self.ui_queue.put(("nick_change", nick, new_nick))
 
     async def _irc_notice(self, nick, params, prefix):
-        text   = params[-1] if params else ""
-        ts_str = self._ts()
+        text = params[-1] if params else ""
         if "!" in prefix:  # user NOTICE (not server)
             target = params[0] if params else self.nick
             display_target = target if target.startswith("#") else "*status*"
-            await self.ui_queue.put(("notice", nick, display_target, text, ts_str))
+            await self.ui_queue.put(("notice", nick, display_target, text))
         else:
-            await self.ui_queue.put(("status", f"NOTICE {text}", ts_str))
+            await self.ui_queue.put(("status", f"NOTICE {text}"))
 
     async def _irc_quit(self, nick, params, prefix):
         self.users.pop(nick, None)
         reason = params[-1] if params else ""
-        await self.ui_queue.put(("quit", nick, reason, self._ts()))
+        await self.ui_queue.put(("quit", nick, reason))
 
     async def _irc_names(self, nick, params, prefix):  # 353 RPL_NAMREPLY
         if len(params) < 4:
@@ -2662,26 +3015,33 @@ class IRCClient:
         # When userhost-in-names CAP is active entries look like "@nick!user@host";
         # strip mode-prefix chars and drop the !user@host suffix so the user list
         # only contains bare nicks (matching how JOIN/PART/QUIT events work).
+        # PREFIX advertises mode-prefix chars as e.g. '(qaohv)~&@%+'
+        # — the substring after ')' is the set to strip. Fall back
+        # to the historical defaults when the server doesn't advertise.
+        prefix_isup = self._isupport.get("PREFIX", "(qaohv)~&@%+")
+        prefix_chars = prefix_isup.split(")", 1)[1] if ")" in prefix_isup else "@+%&~!"
         cleaned = []
         for entry in params[3].split():
-            entry = entry.lstrip(self._get_prefix_chars())   # strip mode prefix
+            entry = entry.lstrip(prefix_chars)
             if "!" in entry:                  # userhost-in-names
                 entry = entry.split("!", 1)[0]
             if entry:
                 cleaned.append(entry)
         await self.ui_queue.put(("names", channel, " ".join(cleaned)))
 
+    async def _irc_endofnames(self, nick, params, prefix):  # 366 RPL_ENDOFNAMES
+        # Only emit /names → *status* output when the user explicitly asked
+        # (via /slash_names).  Suppress the normal post-JOIN 366 noise.
+        channel = params[1] if len(params) > 1 else ""
+        if channel and channel in self._names_to_status:
+            self._names_to_status.discard(channel)
+            await self.ui_queue.put(("names_status", channel))
+
     async def _irc_who_reply(self, nick, params, prefix):  # 352/314
         await self.ui_queue.put(("status", f"{params[0] if params else ''} {' '.join(params[1:])}"))
 
     async def _irc_away_reply(self, nick, params, prefix):  # 301
         await self.ui_queue.put(("status", f"Away: {' '.join(params[1:])}"))
-
-    async def _irc_unaway(self, nick, params, prefix):  # 305 RPL_UNAWAY
-        await self.ui_queue.put(("status", "You are no longer marked as away"))
-
-    async def _irc_nowaway(self, nick, params, prefix):  # 306 RPL_NOWAWAY
-        await self.ui_queue.put(("status", "You have been marked as away"))
 
     async def _irc_topic_reply(self, nick, params, prefix):  # 332
         channel = params[1] if len(params) > 1 else ""
@@ -2719,36 +3079,38 @@ class IRCClient:
 
     async def _irc_away_notify(self, nick, params, prefix):  # AWAY cap
         reason = params[-1] if params else ""
-        ts_str = self._ts()
         if reason:
-            await self.ui_queue.put(("status", f"* {nick} is away: {reason}", ts_str))
+            await self.ui_queue.put(("status", f"* {nick} is away: {reason}"))
         else:
-            await self.ui_queue.put(("status", f"* {nick} is back", ts_str))
+            await self.ui_queue.put(("status", f"* {nick} is back"))
 
     async def _irc_chghost(self, nick, params, prefix):
         new_user = params[0] if params else ""
         new_host = params[1] if len(params) > 1 else ""
-        await self.ui_queue.put(("status",
-            f"* {nick} changed host to {new_user}@{new_host}", self._ts()))
+        await self.ui_queue.put(("status", f"* {nick} changed host to {new_user}@{new_host}"))
 
     async def _irc_account(self, nick, params, prefix):
         account = params[0] if params else "*"
-        ts_str  = self._ts()
+        # Persist on the UserState (creating one if we haven't seen
+        # this nick before) so account-tag consumers elsewhere see
+        # a consistent value. setattr keeps us forward-compatible
+        # even if UserState doesn't yet declare `account`.
         u = self.users.get(nick)
-        if u is not None:
+        if u is None:
+            u = UserState(nick)
+            self.users[nick] = u
+        try:
             u.account = "" if account == "*" else account
+        except Exception:
+            pass  # __slots__ without `account` — ignore
         if account == "*":
-            await self.ui_queue.put(("status", f"* {nick} logged out of services", ts_str))
+            await self.ui_queue.put(("status", f"* {nick} logged out of services"))
         else:
-            await self.ui_queue.put(("status", f"* {nick} is identified as {account}", ts_str))
+            await self.ui_queue.put(("status", f"* {nick} is identified as {account}"))
 
     async def _irc_setname(self, nick, params, prefix):
         realname = params[0] if params else ""
-        ts_str   = self._ts()
-        u = self.users.get(nick)
-        if u is not None:
-            u.realname = realname
-        await self.ui_queue.put(("status", f"* {nick} changed real name to: {realname}", ts_str))
+        await self.ui_queue.put(("status", f"* {nick} changed real name to: {realname}"))
 
     async def _irc_batch(self, nick, params, prefix):
         if not params:
@@ -2758,176 +3120,109 @@ class IRCClient:
             ref = ref_dir[1:]
             self._batch_buffer[ref] = []
             self._batch_types[ref] = params[1] if len(params) > 1 else ""
+            self._batch_params[ref] = params  # save full params for multiline target
         elif ref_dir.startswith("-"):
-            ref        = ref_dir[1:]
+            ref = ref_dir[1:]
             buffered   = self._batch_buffer.pop(ref, [])
             batch_type = self._batch_types.pop(ref, "")
-
-            # netsplit / netjoin get special combined-display treatment
-            if batch_type == "netsplit":
-                await self._dispatch_netsplit_batch(buffered)
+            open_params = self._batch_params.pop(ref, [])
+            # draft/multiline: combine lines into a single message
+            if batch_type == "draft/multiline":
+                await self._handle_multiline_batch(buffered, open_params)
                 return
-            if batch_type == "netjoin":
-                await self._dispatch_netjoin_batch(buffered)
-                return
-
-            # draft/multiline: concatenate all PRIVMSG bodies into one message
-            if batch_type == "draft/multiline" and buffered:
-                # Find the target from the first PRIVMSG in the batch
-                first_pm = next((x for x in buffered if x[0] == "PRIVMSG"), None)
-                if first_pm:
-                    _, fn, fp, fpr, ft = first_pm
-                    combined = "\n".join(
-                        x[2][1] for x in buffered
-                        if x[0] == "PRIVMSG" and len(x[2]) > 1
-                    )
-                    synthetic = list(fp)
-                    if len(synthetic) > 1:
-                        synthetic[1] = combined
-                    self._current_msg_tags = ft
-                    await self._irc_privmsg(fn, synthetic, fpr)
-                return
-
-            # chathistory replay: suppress scoring, mark lines with [↑]
             is_replay = batch_type in ("chathistory", "draft/chathistory")
-            # labeled-response batches need no special handling beyond normal dispatch;
-            # the label on the open-BATCH line ties responses to our original request.
-
             prev_replay = self._current_batch_is_replay
             self._current_batch_is_replay = is_replay
             try:
                 for bcmd, bnick, bparams, bprefix, btags in buffered:
-                    self._current_msg_tags = btags
-                    if bcmd == "BATCH":
-                        # nested batch — recurse
-                        await self._irc_batch(bnick, bparams, bprefix)
-                    else:
-                        handler = self._irc_handlers.get(bcmd)
-                        if handler:
+                    handler = self._irc_handlers.get(bcmd)
+                    if handler:
+                        self._current_msg_tags = btags
+                        try:
                             await handler(bnick, bparams, bprefix)
+                        except Exception as _batch_exc:
+                            await self.ui_queue.put(
+                                ("status", f"[err] batch {bcmd}: {_batch_exc}"))
             finally:
                 self._current_batch_is_replay = prev_replay
                 self._current_msg_tags = {}
 
-    async def _dispatch_netsplit_batch(self, buffered: list) -> None:
-        quit_nicks: list = []
-        server_pair: str = ""
+    async def _handle_multiline_batch(self, buffered: list, open_params: list) -> None:
+        """Combine draft/multiline batch lines into a single PRIVMSG dispatch."""
+        target = open_params[2] if len(open_params) > 2 else ""
+        if not target or not buffered:
+            return
+        combined: list = []
+        first_tags: dict = {}
+        first_nick: str = ""
         for bcmd, bnick, bparams, bprefix, btags in buffered:
-            if bcmd != "QUIT":
+            if bcmd != "PRIVMSG":
                 continue
-            reason = bparams[-1] if bparams else ""
-            if not server_pair:
-                server_pair = reason
-            quit_nicks.append(bnick)
-            self.users.pop(bnick, None)
-            await self.ui_queue.put(("quit_silent", bnick))
-        if quit_nicks:
-            head = ", ".join(quit_nicks[:8])
-            tail = f" +{len(quit_nicks)-8} more" if len(quit_nicks) > 8 else ""
-            srv  = f" ({server_pair})" if server_pair else ""
-            await self.ui_queue.put(("status",
-                f"* Netsplit{srv}: {head}{tail} — {len(quit_nicks)} user(s) quit"))
+            if not first_nick:
+                first_nick = bnick
+                first_tags = btags
+            line_text = bparams[1] if len(bparams) > 1 else ""
+            concat = "draft/multiline-concat" in btags
+            if combined and not concat:
+                combined.append("\n")
+            combined.append(line_text)
+        if not combined or not first_nick:
+            return
+        combined_text = "".join(combined)
+        prev_tags = self._current_msg_tags
+        self._current_msg_tags = first_tags
+        try:
+            await self._irc_privmsg(first_nick, [target, combined_text], "")
+        finally:
+            self._current_msg_tags = prev_tags
 
-    async def _dispatch_netjoin_batch(self, buffered: list) -> None:
-        join_infos: list = []
-        for bcmd, bnick, bparams, bprefix, btags in buffered:
-            if bcmd != "JOIN":
-                continue
-            channel = bparams[0] if bparams else ""
-            join_infos.append((bnick, channel))
-            await self.ui_queue.put(("join_silent", bnick, channel))
-        if join_infos:
-            head = ", ".join(n for n, _ in join_infos[:8])
-            tail = f" +{len(join_infos)-8} more" if len(join_infos) > 8 else ""
-            await self.ui_queue.put(("status",
-                f"* Netjoin: {head}{tail} — {len(join_infos)} user(s) returned"))
+    async def _irc_redact(self, nick, params, prefix):
+        """Handle incoming REDACT command (message-redaction CAP)."""
+        if len(params) < 2:
+            return
+        target = params[0]
+        msgid  = params[1]
+        reason = params[2] if len(params) > 2 else ""
+        await self.ui_queue.put(("redact", nick, target, msgid, reason))
+
+    async def _irc_markread(self, nick, params, prefix):
+        """Handle incoming MARKREAD response (read-marker CAP)."""
+        if len(params) < 2:
+            return
+        target = params[0]
+        ts_arg = params[1]  # e.g. "timestamp=2024-01-15T14:30:00.000Z"
+        await self.ui_queue.put(("markread", target, ts_arg))
 
     async def _irc_tagmsg(self, nick, params, prefix):
-        tags   = self._current_msg_tags
+        tags = self._current_msg_tags
         target = params[0] if params else ""
-        ts_str = self._ts()
-        # +typing (draft/typing)
-        typing = tags.get("+typing", "")
-        if typing == "active":
-            await self.ui_queue.put(("status", f"* {nick} is typing in {target}…", ts_str))
-        elif typing in ("done", "paused"):
-            pass  # silent — stop indicator
-        # +draft/react — emoji reaction
-        react = tags.get("+draft/react", "")
-        if react:
-            await self.ui_queue.put(("status", f"* {nick} reacted {react}", ts_str))
-        # +draft/reply — nick is replying (informational; we show a note)
-        reply_to = tags.get("+draft/reply", "")
-        if reply_to and not react:
-            pass  # msgid noted; could be cross-referenced with a message cache
-        # +draft/channel-context — context hint for multi-channel clients
-        ctx = tags.get("+draft/channel-context", "")
-        if ctx and ctx != target:
-            pass  # informational only
+        typing_state = tags.get("+typing", "")
+        if typing_state in ("active", "paused", "done"):
+            await self.ui_queue.put(("typing", nick, target, typing_state))
+        react    = tags.get("+react", "")
+        reply_to = tags.get("+reply", "")
+        if react and reply_to:
+            await self.ui_queue.put(("react", nick, target, reply_to, react))
 
     async def _irc_invite(self, nick, params, prefix):
         if len(params) < 2:
             return
         invitee = params[0]
         channel = params[1]
-        ts_str  = self._ts()
-        if invitee.lower() == self.nick.lower():
-            await self.ui_queue.put(("status", f"*** {nick} invites you to join {channel}", ts_str))
+        if self._irc_lower(invitee) == self._irc_lower(self.nick):
+            await self.ui_queue.put(("status", f"*** {nick} invites you to join {channel}"))
         else:
-            await self.ui_queue.put(("status", f"*** {nick} invited {invitee} to {channel}", ts_str))
-
-    async def _irc_inviting(self, nick, params, prefix):  # 341 RPL_INVITING
-        target  = params[1] if len(params) > 1 else "?"
-        channel = params[2] if len(params) > 2 else "?"
-        await self.ui_queue.put(("status", f"Inviting {target} to {channel}"))
-
-    async def _irc_useronchannel(self, nick, params, prefix):  # 443 ERR_USERONCHANNEL
-        target  = params[1] if len(params) > 1 else "?"
-        channel = params[2] if len(params) > 2 else "?"
-        await self.ui_queue.put(("status", f"{target} is already on {channel}"))
-
-    def _fmt_standard_reply(self, level: str, params: list) -> str:
-        """Format a FAIL/WARN/NOTE reply: LEVEL COMMAND CODE [context…] :description"""
-        command = params[0] if params else "?"
-        code    = params[1] if len(params) > 1 else "?"
-        desc    = params[-1] if len(params) > 2 else ""
-        ctx_parts = params[2:-1] if len(params) > 3 else []
-        ctx  = f" [{' '.join(ctx_parts)}]" if ctx_parts else ""
-        return f"[{level}] {command} {code}{ctx}: {desc}" if desc else f"[{level}] {command} {code}"
+            # invite-notify: someone else in the channel was invited
+            await self.ui_queue.put(("status", f"*** {nick} invited {invitee} to {channel}"))
 
     async def _irc_fail(self, nick, params, prefix):
-        await self.ui_queue.put(("status", self._fmt_standard_reply("FAIL", params)))
+        await self.ui_queue.put(("status", f"[FAIL] {' '.join(params)}"))
 
     async def _irc_warn(self, nick, params, prefix):
-        await self.ui_queue.put(("status", self._fmt_standard_reply("WARN", params)))
+        await self.ui_queue.put(("status", f"[WARN] {' '.join(params)}"))
 
     async def _irc_note(self, nick, params, prefix):
-        await self.ui_queue.put(("status", self._fmt_standard_reply("NOTE", params)))
-
-    async def _irc_knock(self, nick, params, prefix):  # 710 RPL_KNOCK (received knock)
-        channel = params[1] if len(params) > 1 else "?"
-        user    = params[2] if len(params) > 2 else nick
-        reason  = params[-1] if len(params) > 3 else ""
-        msg = f"*** {user} knocks on {channel}"
-        if reason:
-            msg += f": {reason}"
-        await self.ui_queue.put(("status", msg))
-
-    async def _irc_knockdlvr(self, nick, params, prefix):  # 711 RPL_KNOCKDLVR
-        channel = params[1] if len(params) > 1 else "?"
-        await self.ui_queue.put(("status", f"Knock delivered to {channel}"))
-
-    async def _irc_toomanyknock(self, nick, params, prefix):  # 712 ERR_TOOMANYKNOCK
-        channel = params[1] if len(params) > 1 else "?"
-        await self.ui_queue.put(("status", f"Too many knocks on {channel}"))
-
-    async def _irc_chanopen(self, nick, params, prefix):  # 713 ERR_CHANOPEN
-        channel = params[1] if len(params) > 1 else "?"
-        await self.ui_queue.put(("status", f"{channel} is open — just /join it"))
-
-    async def _irc_knockonchan(self, nick, params, prefix):  # 714 ERR_KNOCKONCHAN
-        channel = params[1] if len(params) > 1 else "?"
-        await self.ui_queue.put(("status", f"You're already in {channel}"))
+        await self.ui_queue.put(("status", f"[NOTE] {' '.join(params)}"))
 
     async def _irc_mononline(self, nick, params, prefix):   # 730 RPL_MONONLINE
         for entry in (params[-1] if params else "").split(","):
@@ -2948,8 +3243,40 @@ class IRCClient:
     async def _irc_monlistfull(self, nick, params, prefix): # 734 ERR_MONLISTFULL
         await self.ui_queue.put(("status", f"[monitor] list full — {' '.join(params[1:])}"))
 
+    async def _irc_reg_success(self, nick, params, prefix):  # 920 RPL_REG_SUCCESS
+        acct = params[1] if len(params) > 1 else "?"
+        await self.ui_queue.put(("status", f"[register] '{acct}' registered successfully"))
+
+    async def _irc_reg_verification(self, nick, params, prefix):  # 921 RPL_REG_VERIFICATION_REQUIRED
+        acct = params[1] if len(params) > 1 else "?"
+        detail = params[-1] if len(params) > 2 else ""
+        await self.ui_queue.put(("status",
+            f"[register] '{acct}' needs email verification" + (f" — {detail}" if detail else "")))
+
+    async def _irc_reg_error(self, nick, params, prefix):  # 922–924 ERR_REG_*
+        msg = params[-1] if params else "unknown error"
+        await self.ui_queue.put(("status", f"[register] error: {msg}"))
+
     async def _irc_whox_reply(self, nick, params, prefix):  # 354 RPL_WHOSPCRPL
-        await self.ui_queue.put(("status", f"[who] {' '.join(params[1:])}"))
+        vals = params[1:]  # drop our nick (params[0])
+        token = vals[0] if vals else ""
+        fields = self._whox_tokens.get(token, "")
+        if fields:
+            # WHOX servers always return fields in this fixed order (§ WHOX spec),
+            # skipping any that weren't requested. 't' is first and already consumed.
+            FIELD_ORDER = "cuihsnfdlar"
+            FIELD_LABELS = {
+                'c': 'chan',  'u': 'user', 'i': 'ip',   'h': 'host',
+                's': 'server','n': 'nick', 'f': 'flags', 'd': 'hop',
+                'l': 'idle',  'a': 'acct', 'r': 'real',
+            }
+            ordered = [f for f in FIELD_ORDER if f in fields]
+            data = vals[1:]  # values after token
+            parts = [f"{FIELD_LABELS.get(f, f)}={data[i]}"
+                     for i, f in enumerate(ordered) if i < len(data)]
+            await self.ui_queue.put(("status", f"[who] {'  '.join(parts)}"))
+        else:
+            await self.ui_queue.put(("status", f"[who] {' '.join(vals)}"))
 
     async def _irc_isupport(self, nick, params, prefix):  # 005 RPL_ISUPPORT
         """Parse ISUPPORT tokens and extract useful server capabilities."""
@@ -2961,21 +3288,16 @@ class IRCClient:
                 self._isupport.pop(token[1:], None)
             elif "=" in token:
                 k, v = token.split("=", 1)
-                # Unescape \xHH sequences that some servers embed in ISUPPORT values
-                v = re.sub(r"\\x([0-9A-Fa-f]{2})",
-                           lambda m: chr(int(m.group(1), 16)), v)
                 self._isupport[k] = v
             else:
                 self._isupport[token] = True
-        # Announce the network name the first time we see it
-        if "NETWORK" in self._isupport and "_network_announced" not in self._isupport:
-            self._isupport["_network_announced"] = True
-            await self.ui_queue.put(("status",
-                f"Network: {self._isupport['NETWORK']}"))
-        if "UTF8ONLY" in self._isupport and "_utf8only_announced" not in self._isupport:
-            self._isupport["_utf8only_announced"] = True
-            await self.ui_queue.put(("status",
-                "[isupport] Server is UTF-8 only (UTF8ONLY)"))
+        # Announce the network name the first time we see it.
+        # The flag lives on the instance, not in _isupport, so it
+        # doesn't shadow real ISUPPORT tokens.
+        network = self._isupport.get("NETWORK")
+        if isinstance(network, str) and not self._network_announced:
+            self._network_announced = True
+            await self.ui_queue.put(("status", f"Network: {network}"))
 
     async def _irc_no_such_nick(self, nick, params, prefix):  # 401 ERR_NOSUCHNICK
         target = params[1] if len(params) > 1 else params[0] if params else "?"
@@ -3004,10 +3326,6 @@ class IRCClient:
         h["AUTHENTICATE"] = self._irc_authenticate
         h["903"]          = self._irc_sasl_ok
         h["904"]          = self._irc_sasl_fail
-        h["902"]          = self._irc_sasl_nicklocked
-        h["906"]          = self._irc_sasl_aborted
-        h["907"]          = self._irc_sasl_alreadyauthed
-        h["908"]          = self._irc_sasl_mechs
         h["900"]          = self._irc_logged_in
         h["001"]          = self._irc_welcome
         h["JOIN"]         = self._irc_join
@@ -3021,15 +3339,12 @@ class IRCClient:
         h["INVITE"]       = self._irc_invite
         h["QUIT"]         = self._irc_quit
         h["353"]          = self._irc_names
+        h["366"]          = self._irc_endofnames
         h["301"]          = self._irc_away_reply
-        h["305"]          = self._irc_unaway
-        h["306"]          = self._irc_nowaway
         h["332"]          = self._irc_topic_reply
         h["331"]          = self._irc_no_topic
         h["433"]          = self._irc_nick_in_use
         h["432"]          = self._irc_bad_nick
-        h["341"]          = self._irc_inviting
-        h["443"]          = self._irc_useronchannel
         h["401"]          = self._irc_no_such_nick
         h["005"]          = self._irc_isupport
         h["AWAY"]         = self._irc_away_notify
@@ -3038,6 +3353,8 @@ class IRCClient:
         h["SETNAME"]      = self._irc_setname
         h["BATCH"]        = self._irc_batch
         h["TAGMSG"]       = self._irc_tagmsg
+        h["REDACT"]       = self._irc_redact
+        h["MARKREAD"]     = self._irc_markread
         h["FAIL"]         = self._irc_fail
         h["WARN"]         = self._irc_warn
         h["NOTE"]         = self._irc_note
@@ -3046,11 +3363,9 @@ class IRCClient:
         h["732"]          = self._irc_monlist
         h["734"]          = self._irc_monlistfull
         h["354"]          = self._irc_whox_reply
-        h["710"]          = self._irc_knock
-        h["711"]          = self._irc_knockdlvr
-        h["712"]          = self._irc_toomanyknock
-        h["713"]          = self._irc_chanopen
-        h["714"]          = self._irc_knockonchan
+        h["920"]          = self._irc_reg_success
+        h["921"]          = self._irc_reg_verification
+        h["922"] = h["923"] = h["924"] = self._irc_reg_error
         # WHOIS numerics — bind each with its code via a closure
         for _code in _WHOIS_REPLIES:
             _c = _code
@@ -3093,18 +3408,27 @@ class IRCClient:
         self.send_raw(f"KICK {channel} {user} :{reason}" if reason else f"KICK {channel} {user}")
 
     def cmd_msg(self, target: str, text: str, is_action: bool = False) -> Optional[tuple]:
-        # Use labeled-response when both labeled-response and echo-message are active.
-        # The label lets us match the server echo back to this specific send so we
-        # don't double-display messages from other sessions using the same nick.
-        use_label = ("labeled-response" in self._active_caps
-                     and "echo-message" in self._active_caps)
-        body = f"PRIVMSG {target} :\x01ACTION {text}\x01" if is_action else f"PRIVMSG {target} :{text}"
-        if use_label:
+        if "\n" in text and not is_action:
+            if "draft/multiline" in self._active_caps:
+                return self._cmd_msg_multiline(target, text)
+            # Fallback: send each line as its own PRIVMSG. send_raw strips
+            # newlines, so without this branch every line after the first
+            # would be silently joined to the previous one.
+            lines = [ln for ln in text.split("\n") if ln]
+            if not lines:
+                return None
+            for ln in lines[:-1]:
+                self.send_raw(f"PRIVMSG {target} :{ln}")
+            text = lines[-1]
+        body = f":\x01ACTION {text}\x01" if is_action else f":{text}"
+        if "labeled-response" in self._active_caps:
             label = self._next_label()
-            self._sent_labels.add(label)
-            self.send_tagged({"label": label}, body)
+            if len(self._pending_labels) >= 10000:
+                self._pending_labels.clear()
+            self._pending_labels.add(label)
+            self.send_tagged({"label": label}, f"PRIVMSG {target} {body}")
         else:
-            self.send_raw(body)
+            self.send_raw(f"PRIVMSG {target} {body}")
 
         if self.nick not in self.users:
             u = UserState(self.nick)
@@ -3118,6 +3442,22 @@ class IRCClient:
         a_score = 0  # own messages are human
         rolling_ai = int(u_state.rolling_ai_likelihood())
         return ("msg", self.nick, target, text, u_score, m_score, a_score, rolling_ai, is_action)
+
+    def _cmd_msg_multiline(self, target: str, text: str) -> Optional[tuple]:
+        """Send text containing \\n as a draft/multiline BATCH."""
+        ref = f"ml{self._next_label()}"
+        self.send_raw(f"BATCH +{ref} draft/multiline {target}")
+        for ln in text.split("\n"):
+            self.send_tagged({"batch": ref}, f"PRIVMSG {target} :{ln}")
+        self.send_raw(f"BATCH -{ref}")
+        if self.nick not in self.users:
+            u = UserState(self.nick)
+            self.users[self.nick] = u
+        u_state = self.users[self.nick]
+        u_state.record_message(text)
+        u_score = self.scoring.score_user(u_state)
+        rolling_ai = int(u_state.rolling_ai_likelihood())
+        return ("msg", self.nick, target, text, u_score, 50, 0, rolling_ai, False)
 
     def cmd_service(self, service: str, command: str) -> None:
         self.send_raw(f"PRIVMSG {service} :{command}")
@@ -3135,25 +3475,23 @@ class IRCClient:
     def cmd_invite(self, nick: str, channel: str) -> None:
         self.send_raw(f"INVITE {nick} {channel}")
 
-    def cmd_knock(self, channel: str, message: str = "") -> None:
-        if message:
-            self.send_raw(f"KNOCK {channel} :{message}")
-        else:
-            self.send_raw(f"KNOCK {channel}")
-
-    def cmd_markread(self, target: str, msgid: str = "*") -> None:
-        """Send a MARKREAD command for draft/read-marker support."""
-        if "draft/read-marker" in self._active_caps:
-            self.send_raw(f"MARKREAD {target} timestamp={msgid}" if msgid != "*"
-                         else f"MARKREAD {target}")
-
     def cmd_who(self, target: str) -> None:
         self.send_raw(f"WHO {target}")
 
-    def cmd_whox(self, target: str, fields: str = "hnuraf", token: str = "100") -> None:
-        """Send WHOX query (extended WHO) when server advertises WHOX in ISUPPORT."""
+    def cmd_whox(self, target: str, fields: str = "tnhuafr") -> None:
+        """Send WHOX query (extended WHO) when server advertises WHOX in ISUPPORT.
+
+        't' is always injected so the 354 reply carries the token, letting
+        _irc_whox_reply map positional fields back to human-readable labels.
+        The token rotates 1–999 so concurrent queries don't collide.
+        """
         if "WHOX" in self._isupport:
             f = fields.replace(" ", "")
+            if "t" not in f:
+                f = "t" + f
+            token = str(self._whox_seq)
+            self._whox_seq = self._whox_seq % 999 + 1
+            self._whox_tokens[token] = f
             self.send_raw(f"WHO {target} %{f},{token}")
         else:
             self.send_raw(f"WHO {target}")
@@ -3201,6 +3539,13 @@ class IRCClient:
                             u_state: "UserState", u_score: int, m_score: int) -> None:
         """Run AI inference off the read loop, then push an update event."""
         if not self.scoring.ai_detector.enabled:
+            # AI detection off (--no-ai or /aitoggle), but we still want a
+            # complete audit trail in ai_scores.log.  Skip record_message so
+            # the rolling-average isn't polluted with synthetic zeros.
+            log_ai_event(
+                nick, target, msg, u_score, m_score, 0,
+                int(u_state.rolling_ai_likelihood()),
+            )
             return
         a_score = 0
         detail: Dict[str, float] = {"prob": 0.0, "heu": 0.0, "bino": 0.0, "cls": 0.0, "llama": 0.0}
@@ -3237,6 +3582,29 @@ class IRCClient:
                 if fp_sim > 0.0:
                     # Max +35 percentage points at full similarity; tapers off smoothly.
                     prob = min(1.0, prob + 0.35 * fp_sim)
+
+                # Behavioral: timing regularity — bots tend to post at very uniform
+                # intervals.  Coefficient of variation (std/mean) of inter-message
+                # gaps below 0.30 is unusual for human IRC typing; below 0.15 is
+                # near-impossible outside scripted clients.
+                if len(u_state.msg_times) >= 6:
+                    _times = list(u_state.msg_times)
+                    _mean_t = sum(_times) / len(_times)
+                    if _mean_t > 0.5:  # ignore burst-typing noise
+                        _var = sum((t - _mean_t) ** 2 for t in _times) / len(_times)
+                        _cv = (_var ** 0.5) / _mean_t
+                        if _cv < 0.15:
+                            prob = min(1.0, prob + 0.20)
+                        elif _cv < 0.30:
+                            prob = min(1.0, prob + 0.10)
+
+                # Rolling momentum: if this user is already tracking as AI across
+                # several past messages, give new messages a small confidence nudge
+                # so the rolling average crosses the suspect threshold faster.
+                _rolling_prior = u_state.rolling_ai_likelihood()
+                if _rolling_prior >= 75.0 and len(u_state.ai_scores) >= 4:
+                    prob = min(1.0, prob + 0.10)
+
                 a_score = int(prob * 100)
         except asyncio.CancelledError:
             # Task cancelled (e.g. during shutdown) — log the partial result before
@@ -3250,7 +3618,19 @@ class IRCClient:
             )
             raise
         except Exception:
-            pass  # inference failed; log with score 0 so the event is still recorded
+            # Inference failed for some other reason (timeout, ML error, etc).
+            # Don't record_message — that would skew the rolling AI average
+            # toward 'human' and mislead the suspect heuristic — but still
+            # write the message to ai_scores.log so the audit trail is
+            # complete.  Whatever partial signals we managed to compute are
+            # preserved in `detail`; un-set fields stay at 0.0.
+            log_ai_event(
+                nick, target, msg, u_score, m_score, a_score,
+                int(u_state.rolling_ai_likelihood()),
+                heu_score=detail["heu"], bino_score=detail["bino"],
+                cls_score=detail["cls"], llama_score=detail["llama"],
+            )
+            return
         u_state.record_message(msg, a_score)
         rolling_ai = int(u_state.rolling_ai_likelihood())
         log_ai_event(
@@ -3464,6 +3844,11 @@ class TUI:
         _psid = self._primary_server_id
         for name in ("*status*", "*dashboard*"):
             win = ChatWindow(name, is_channel=False, server_id=_psid)
+            # *dashboard* is a synthetic view that's rebuilt by clearing
+            # in-memory lines and re-adding everything; persisting it would
+            # accumulate identical rebuild dumps in chat_logs/ for no value.
+            if name == "*dashboard*":
+                win._persist = False
             self.windows.append(win)
             self.window_by_name[name] = win
 
@@ -3471,10 +3856,18 @@ class TUI:
         # join errors / join success messages land there immediately.
         if DEFAULT_CHANNEL:
             _dcw = ChatWindow(DEFAULT_CHANNEL, is_channel=True, server_id=_psid)
+            _primary_ctx.channel_users[DEFAULT_CHANNEL] = set()
+            # Load persisted chat history before the new-session marker so
+            # previous messages appear above it in chronological order.
+            _hist = load_chat_history(DEFAULT_CHANNEL)
+            for _hl in _hist:
+                _dcw.lines.append(_hl)
+                _dcw._line_msgids.append("")
+            if _hist:
+                _dcw._wrap_dirty = True
+            _dcw.add_line(f"log channel {DEFAULT_CHANNEL} enabled", timestamp=True)
             self.windows.append(_dcw)
             self.window_by_name[DEFAULT_CHANNEL] = _dcw
-            _primary_ctx.channel_users[DEFAULT_CHANNEL] = set()
-            _dcw.add_line(f"log channel {DEFAULT_CHANNEL} enabled", timestamp=True)
 
         # Alias primary ctx dicts directly onto self so all existing code continues
         # to work without changes.  _sync_ctx() swaps these aliases when a
@@ -3516,11 +3909,23 @@ class TUI:
         self._prev_on_dashboard = False           # edge-detect navigate-back-to-dashboard
         self._dashboard_profile_locked = False    # one-shot: skip reset on same-tick navigate
 
+        # IRCv3 +typing client tag
+        # Incoming: {target_lower: {nick_lower: [orig_nick, state, expiry_monotonic]}}
+        #   state "active" expires in 6 s, "paused" in 30 s; "done" removes immediately
+        self._typing_peers: dict = {}
+        # Outgoing
+        self._typing_out_target: str = ""   # target we are currently reporting typing for
+        self._typing_out_last:   float = 0.0  # monotonic time of last +typing=active sent
+        self._typing_out_state:  str = ""   # "active" | "paused" | ""
+        self._typing_last_key:   float = 0.0  # monotonic time of last buffer-modifying key
+
         # Claude API state
         self.ai_chat_model: str = CLAUDE_DEFAULT_MODEL   # key into CLAUDE_MODELS
         self._askai_pending: bool = False                # prevent concurrent calls
         self._anthropic_client = None                    # reuse HTTP connection pool
         self._openai_client    = None
+        self._deepseek_client  = None
+        self._copilot_client   = None
 
         # Pre-compute curses attributes (avoids repeated function calls every frame)
         try:
@@ -3555,7 +3960,10 @@ class TUI:
         self._input_dirty   = True
 
         # Cached window dimensions (updated only on resize)
-        self._tw     = max(1, self.chat_win.getmaxyx()[1] - 1)   # chat text cols
+        # Compute _tw from the logical expected width, not getmaxyx(), so that a
+        # silently-failed chat_win.resize() can't leave _tw at the old oversized
+        # value and cause text/erase to bleed into the userlist area.
+        self._tw     = max(1, max(1, self.width - self.userlist_width) - 1)
         self._uw     = max(1, self.userlist_width - 2)            # userlist interior cols
         self._input_w = max(1, self.input_win.getmaxyx()[1] - 4) # input text cols
 
@@ -3627,6 +4035,14 @@ class TUI:
         wk  = self._wk(sid, name)
         if wk not in self.window_by_name:
             win = ChatWindow(name, is_channel=is_channel, server_id=sid)
+            # Restore persisted chat history before first use so the window
+            # shows previous messages immediately on creation.
+            hist = load_chat_history(name)
+            for hl in hist:
+                win.lines.append(hl)
+                win._line_msgids.append("")
+            if hist:
+                win._wrap_dirty = True
             self.windows.append(win)
             self.window_by_name[wk] = win
             if is_channel and name not in self.channel_users:
@@ -3635,7 +4051,7 @@ class TUI:
 
     def _chat_text_width(self) -> int:
         """Usable text columns in the chat window (leaves 1-col right margin)."""
-        return max(1, self.chat_win.getmaxyx()[1] - 1)
+        return self._tw  # always consistent with the value used for rendering
 
     def _wrap_window(self, win: ChatWindow) -> None:
         max_width = self._chat_text_width()
@@ -3645,7 +4061,7 @@ class TUI:
         url_map: Dict[int, str] = {}
 
         def _wrap_raw(raw: str) -> None:
-            """Wrap a raw (possibly IRC-formatted) text fragment into wrapped[]."""
+            """Wrap a single raw fragment (no \\n) into wrapped[], word-wrapping if wide."""
             if not raw:
                 return
             s = irc_strip_formatting(raw)
@@ -3659,23 +4075,17 @@ class TUI:
                 s   = irc_strip_formatting(raw)
             wrapped.append(raw)
 
-        for line in win.lines:
-            if not line:
+        def _wrap_one_line(raw_line: str) -> None:
+            """Wrap one logical line (no embedded \\n): URL-split then word-wrap."""
+            if not raw_line:
                 wrapped.append("")
-                continue
-            stripped = irc_strip_formatting(line)
+                return
+            stripped = irc_strip_formatting(raw_line)
             url_matches = list(_URL_RE.finditer(stripped))
             if url_matches:
-                # Extract each URL as its own single display line so long URLs
-                # never get split across rows.  The full URL is stored in url_map;
-                # the display line is truncated with "…" only if needed.
-                #
-                # Use `stripped` (not `line`) for position tracking: IRC bots
-                # sometimes apply bold/underline codes around or inside the URL
-                # text, so searching the raw line for the stripped URL string
-                # would fail.  The stripped text has no such codes and find()
-                # is always reliable on it.  Pre/post segments are wrapped via
-                # _wrap_raw which accepts plain text without IRC codes.
+                # Extract each URL as its own display line so long URLs never split.
+                # Use stripped text for URL position tracking (IRC codes in raw_line
+                # would shift offsets); pre/post segments fed through _wrap_raw.
                 remaining = stripped
                 for um in url_matches:
                     url_str   = um.group(0)
@@ -3692,17 +4102,52 @@ class TUI:
                     remaining = remaining[pos + len(url_str):].lstrip()
                 _wrap_raw(remaining)
             else:
-                # Normal word-wrap — no URLs present
+                r = raw_line
                 s = stripped
                 while _str_visual_width(s) > max_width:
-                    rm = _irc_visual_pos(line, max_width)
-                    sp = line.rfind(" ", 0, rm)
+                    rm = _irc_visual_pos(r, max_width)
+                    sp = r.rfind(" ", 0, rm)
                     if sp == -1:
                         sp = rm if rm > 0 else 1
-                    wrapped.append(line[:sp])
-                    line = line[sp:].lstrip()
-                    s    = irc_strip_formatting(line)
-                wrapped.append(line)
+                    wrapped.append(r[:sp])
+                    r = r[sp:].lstrip()
+                    s = irc_strip_formatting(r)
+                wrapped.append(r)
+
+        _msgids      = win._line_msgids
+        _unread_from = win._unread_from
+
+        for _src_i, line in enumerate(win.lines):
+            _src_msgid = _msgids[_src_i] if _src_i < len(_msgids) else ""
+
+            # read-marker: inject separator before the first unread line
+            if _unread_from >= 0 and _src_i == _unread_from:
+                _sep_inner = "  unread  "
+                _sep_dash  = "─" * max(0, (max_width - len(_sep_inner)) // 2)
+                wrapped.append(_sep_dash + _sep_inner + _sep_dash)
+
+            if not line:
+                wrapped.append("")
+                continue
+
+            # draft/multiline: messages with embedded \n from a multiline batch
+            if "\n" in line:
+                parts = line.split("\n")
+                _wrap_one_line(parts[0])
+                for _sp in parts[1:]:
+                    _wrap_one_line("    " + _sp if _sp else "")
+            else:
+                _wrap_one_line(line)
+
+            # Inject a reactions summary line immediately after this message
+            if _src_msgid and _src_msgid in win._reactions:
+                _reacts = win._reactions[_src_msgid]
+                _rparts = []
+                for _emoji, _nicks in _reacts.items():
+                    _cnt = len(_nicks)
+                    _rparts.append(f"{_emoji}×{_cnt}" if _cnt > 1 else _emoji)
+                if _rparts:
+                    wrapped.append("  [" + "  ".join(_rparts) + "]")
 
         win.wrapped_cache    = wrapped
         win.url_map          = url_map
@@ -4052,6 +4497,61 @@ class TUI:
                 self._openai_client = None      # discard on error; recreate next call
                 return f"[error] {exc}", "?"
 
+        if provider == "deepseek":
+            if not OPENAI_AVAILABLE:
+                return ("[error] openai package not installed — "
+                        "run: pip install openai"), "?"
+            if not DEEPSEEK_API_KEY:
+                return ("[error] DEEPSEEK_API_KEY not set — "
+                        "set the environment variable and restart"), "?"
+            try:
+                if self._deepseek_client is None:
+                    self._deepseek_client = _openai_mod.AsyncOpenAI(
+                        api_key=DEEPSEEK_API_KEY,
+                        base_url="https://api.deepseek.com")
+                resp = await self._deepseek_client.chat.completions.create(
+                    model=model_id, max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                answer = (resp.choices[0].message.content
+                          if resp.choices else "(empty response)")
+                usage  = getattr(resp, "usage", None)
+                tokens = str(usage.total_tokens) if usage else "?"
+                return answer, tokens
+            except Exception as exc:
+                self._deepseek_client = None
+                return f"[error] {exc}", "?"
+
+        if provider == "copilot":
+            if not OPENAI_AVAILABLE:
+                return ("[error] openai package not installed — "
+                        "run: pip install openai"), "?"
+            if not GITHUB_TOKEN:
+                return ("[error] GITHUB_TOKEN not set — "
+                        "set the environment variable and restart"), "?"
+            try:
+                if self._copilot_client is None:
+                    self._copilot_client = _openai_mod.AsyncOpenAI(
+                        api_key=GITHUB_TOKEN,
+                        base_url="https://api.githubcopilot.com",
+                        default_headers={
+                            "editor-version":        "eyearesee/1.0",
+                            "editor-plugin-version": "eyearesee/1.0",
+                            "copilot-integration-id": "eyearesee",
+                        })
+                resp = await self._copilot_client.chat.completions.create(
+                    model=model_id, max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                answer = (resp.choices[0].message.content
+                          if resp.choices else "(empty response)")
+                usage  = getattr(resp, "usage", None)
+                tokens = str(usage.total_tokens) if usage else "?"
+                return answer, tokens
+            except Exception as exc:
+                self._copilot_client = None
+                return f"[error] {exc}", "?"
+
         if provider == "ollama":
             loop = asyncio.get_running_loop()
             answer, tokens = await loop.run_in_executor(
@@ -4177,8 +4677,10 @@ class TUI:
             self.input_win.mvwin(self.height - 4, 0)
         except curses.error:
             pass
-        # Refresh cached dimension values and force full repaint
-        self._tw             = max(1, self.chat_win.getmaxyx()[1] - 1)
+        # Refresh cached dimension values and force full repaint.
+        # Use the expected logical width (not getmaxyx) so a silently-failed
+        # resize can't leave _tw pointing at the old oversized chat window.
+        self._tw             = max(1, chat_w - 1)
         self._uw             = max(1, self.userlist_width - 2)
         self._input_w        = max(1, self.input_win.getmaxyx()[1] - 4)
         self._content_height = max(1, self.chat_height - 1)
@@ -4212,6 +4714,19 @@ class TUI:
 
         # Row 0 is permanently the title bar; content occupies rows 1..chat_height-1.
         content_height = self._content_height
+
+        # IRCv3 typing: expire stale entries then check if any peers are typing here.
+        _now_m = time.monotonic()
+        _tgt_key = current_win.name.lower()
+        _peers = self._typing_peers.get(_tgt_key)
+        if _peers:
+            _stale = [_n for _n, _e in _peers.items() if _now_m > _e[2]]
+            for _n in _stale:
+                del _peers[_n]
+        _typing_names = [_e[0] for _e in _peers.values()] if _peers else []
+        if _typing_names:
+            content_height = max(1, content_height - 1)  # reserve bottom row for indicator
+
         max_offset = max(0, total - content_height)
         current_win.scroll_offset = min(current_win.scroll_offset, max_offset)
         offset = current_win.scroll_offset
@@ -4270,6 +4785,20 @@ class TUI:
                 base = attr_normal
             _render(i + 1, line, base, tw)  # +1: row 0 is reserved for the title bar
 
+        # Typing indicator — drawn on the row just below the last message row.
+        if _typing_names:
+            if len(_typing_names) == 1:
+                _typ_text = f" ✎ {_typing_names[0]} is typing…"
+            elif len(_typing_names) == 2:
+                _typ_text = f" ✎ {_typing_names[0]} and {_typing_names[1]} are typing…"
+            else:
+                _typ_text = f" ✎ {len(_typing_names)} people are typing…"
+            try:
+                self.chat_win.addstr(content_height + 1, 1,
+                                     _typ_text[:tw], curses.A_DIM)
+            except curses.error:
+                pass
+
         title = (f" {current_win.name} [↑ {offset} line{'s' if offset != 1 else ''}] "
                  if offset > 0 else f" {current_win.name} ")
         try:
@@ -4281,14 +4810,26 @@ class TUI:
         uw = self._uw
         self.user_win.erase()
         self.user_win.border()
-        header = f" Users ({self.current_channel or 'None'}) "
+
+        # Prefer the current window's channel; fall back to current_channel for
+        # non-channel windows (status/dashboard) so the userlist stays populated
+        # while browsing those windows.  DM windows (no leading #) are excluded.
+        cur_win = self.get_current_window()
+        if cur_win.is_channel and cur_win.name in self.channel_users:
+            display_ch = cur_win.name
+        elif self.current_channel and self.current_channel in self.channel_users:
+            display_ch = self.current_channel
+        else:
+            display_ch = None
+
+        header = f" Users ({display_ch or 'None'}) "
         try:
             self.user_win.addstr(0, 1, header[:uw], self._attr_userheader)
         except curses.error:
             pass
 
-        if self.current_channel and self.current_channel in self.channel_users:
-            ch = self.current_channel
+        if display_ch:
+            ch = display_ch
             if ch not in self._sorted_users:
                 self._sorted_users[ch] = sorted(self.channel_users[ch])
             users = self._sorted_users[ch]
@@ -4425,15 +4966,26 @@ class TUI:
         self._sync_draw_ctx()
 
         refreshed = []
+        _chat_refreshed = False
         if self._chat_dirty:
             self._draw_chat()
             self._chat_dirty = False
             refreshed.append(self.chat_win)
+            _chat_refreshed = True
         if self._userlist_dirty:
             if self._show_userlist:
                 self._draw_userlist()
                 refreshed.append(self.user_win)
             self._userlist_dirty = False
+        elif self._show_userlist and _chat_refreshed:
+            # Re-assert the userlist after every chat refresh even when the
+            # userlist itself hasn't changed.  chat_win.noutrefresh() writes the
+            # full chat buffer (including the blank right-margin column) to the
+            # virtual screen.  If the window was ever the wrong size (e.g. a
+            # silently-failed resize) those writes can land on top of the |
+            # border.  Calling user_win.noutrefresh() second means the userlist
+            # always wins that region, keeping the border and nicks intact.
+            refreshed.append(self.user_win)
         if self._input_dirty:
             self._draw_input()
             self._input_dirty = False
@@ -4448,7 +5000,22 @@ class TUI:
     def get_current_window(self) -> ChatWindow:
         return self.windows[self.current_window_index]
 
+    def _mark_window_read(self, win: "ChatWindow") -> None:
+        """Send MARKREAD for *win* and clear its unread marker."""
+        if win.name in ("*status*", "*dashboard*") or not win.is_channel:
+            return
+        client = self._active_client()
+        if "read-marker" not in client._active_caps:
+            return
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        client.send_raw(f"MARKREAD {win.name} timestamp={ts}")
+        win._unread_from = -1
+        win._wrap_dirty = True
+
     def switch_to_next_window(self):
+        prev_win = self.get_current_window()
+        self._mark_window_read(prev_win)
         self.current_window_index = (self.current_window_index + 1) % len(self.windows)
         win = self.get_current_window()
         if win.name not in ("*status*", "*dashboard*"):
@@ -4456,6 +5023,7 @@ class TUI:
         if win.name in self._unread_windows:
             win.scroll_offset = 0  # jump to bottom so the new messages are visible
         self._unread_windows.discard(win.name)
+        win._unread_from = -1
         self._chat_dirty = self._userlist_dirty = self._input_dirty = True
         self.dirty = True
 
@@ -4502,6 +5070,7 @@ class TUI:
         h["notice"]      = self._ev_notice
         h["nick_change"] = self._ev_nick_change
         h["names"]       = self._ev_names
+        h["names_status"]= self._ev_names_status
         h["clear_users"] = self._ev_clear_users
         h["topic"]       = self._ev_topic
         h["join"]        = self._ev_join
@@ -4509,11 +5078,11 @@ class TUI:
         h["join_error"]  = self._ev_join_error
         h["part"]        = self._ev_part
         h["quit"]        = self._ev_quit
-        h["quit_silent"] = self._ev_quit_silent
-        h["join_silent"] = self._ev_join_silent
-        h["kick"]        = self._ev_kick
-        h["mode"]        = self._ev_mode
-        for k in ("whois", "status"):
+        h["typing"]      = self._ev_typing
+        h["react"]       = self._ev_react
+        h["redact"]      = self._ev_redact
+        h["markread"]    = self._ev_markread
+        for k in ("whois", "kick", "mode", "status"):
             h[k] = self._ev_status_line
 
     async def handle_event(self, event: tuple) -> None:
@@ -4545,6 +5114,8 @@ class TUI:
         ts_str    = _extra[0] if len(_extra) > 0 else None
         account   = _extra[1] if len(_extra) > 1 else ""
         is_replay = _extra[2] if len(_extra) > 2 else False
+        msgid     = _extra[3] if len(_extra) > 3 else ""
+        reply_to  = _extra[4] if len(_extra) > 4 else ""
         if nick.lower() in self.ignored_nicks:
             return
         if target.startswith("#"):
@@ -4557,11 +5128,28 @@ class TUI:
             win_name = nick
             is_chan   = False
         win = self.ensure_window(win_name, is_channel=is_chan)
+        # read-marker: mark the first unread line when this window is not active
+        if not is_replay and win is not self.get_current_window() and win._unread_from < 0:
+            win._unread_from = len(win.lines)  # points to the line about to be added
+        # +reply: show a quoted preview of the referenced message
+        if reply_to:
+            ref = win._msg_store.get(reply_to)
+            if ref:
+                ref_nick, ref_prev = ref
+                p = ref_prev[:50] + "…" if len(ref_prev) > 50 else ref_prev
+                win.add_line(f"  ↩ {ref_nick}: {p}", timestamp=False)
         prefix_str = f"* {nick} " if is_action else f"<{nick}> "
         # Replay lines get a visual marker; account shown if account-tag active
         replay_mark = "[↑] " if is_replay else ""
         acc_mark    = f"[{account}]" if account else ""
-        win.add_line(f"{replay_mark}{prefix_str}{acc_mark}{msg}", ts_str=ts_str)
+        win.add_line(f"{replay_mark}{prefix_str}{acc_mark}{msg}", ts_str=ts_str, msgid=msgid)
+        # Store msgid for reply/react lookups; prune if over limit
+        if msgid:
+            if len(win._msg_store) >= 500:
+                del win._msg_store[next(iter(win._msg_store))]
+            preview = f"* {nick} {msg}" if is_action else msg
+            win._msg_store[msgid] = (nick, preview)
+            win._last_msgid = msgid
         our_nick = self._active_client().nick
         if (our_nick and nick.lower() != our_nick.lower()
                 and not self.mention_beep_muted
@@ -4586,31 +5174,115 @@ class TUI:
             self._dashboard_dirty = True
         else:
             self._suspect_nicks.discard(nick)
-        if win_name in self.channel_users:
+        if win_name in self.channel_users and nick not in self.channel_users[win_name]:
             self.channel_users[win_name].add(nick)
             self._sorted_users.pop(win_name, None)
             self._userlist_dirty = True
+        # A sent message implicitly clears any typing indicator for that nick.
+        tgt_peers = self._typing_peers.setdefault(win_name.lower(), {})
+        if tgt_peers.pop(nick.lower(), None) is not None:
+            pass  # _chat_dirty already set below
         self._chat_dirty = True
         self.dirty = True
 
+    async def _ev_typing(self, event):
+        _, nick, target, state = event
+        tgt = target.lower()
+        nick_l = nick.lower()
+        peers = self._typing_peers.setdefault(tgt, {})
+        if state == "done":
+            peers.pop(nick_l, None)
+        else:
+            expiry = time.monotonic() + (6.0 if state == "active" else 30.0)
+            peers[nick_l] = [nick, state, expiry]
+        if tgt == self.get_current_window().name.lower():
+            self._chat_dirty = True
+            self.dirty = True
+
+    async def _ev_react(self, event):
+        _, nick, target, msgid, emoji = event
+        win_name = target if target.startswith("#") else nick
+        wk = self._wk(self._active_server_id, win_name)
+        win = self.window_by_name.get(wk)
+        if win is None:
+            return
+        nicks = win._reactions.setdefault(msgid, {}).setdefault(emoji, [])
+        if nick not in nicks:
+            nicks.append(nick)
+        win._wrap_dirty = True
+        if win is self.get_current_window():
+            self._chat_dirty = True
+            self.dirty = True
+
+    async def _ev_redact(self, event):
+        _, nick, target, msgid, reason = event
+        win_name = target if target.startswith("#") else nick
+        wk = self._wk(self._active_server_id, win_name)
+        win = self.window_by_name.get(wk)
+        if win is None:
+            return
+        for i, mid in enumerate(win._line_msgids):
+            if mid == msgid:
+                old_line = win.lines[i]
+                ts_prefix = old_line[:8] if old_line.startswith("[") and len(old_line) >= 8 else ""
+                reason_str = f": {reason}" if reason else ""
+                win.lines[i] = f"{ts_prefix} [redacted by {nick}{reason_str}]"
+                win._wrap_dirty = True
+                break
+        if win is self.get_current_window():
+            self._chat_dirty = True
+            self.dirty = True
+
+    async def _ev_markread(self, event):
+        _, target, ts_arg = event
+        wk = self._wk(self._active_server_id, target)
+        win = self.window_by_name.get(wk)
+        if win is None:
+            return
+        if not ts_arg.startswith("timestamp="):
+            return
+        ts_iso = ts_arg[len("timestamp="):]
+        marker_time = _parse_server_time(ts_iso)  # returns "[HH:MM]" or None
+        if not marker_time:
+            return
+        # Find index of the first line whose timestamp is after the marker
+        unread_from = -1
+        for i, line in enumerate(win.lines):
+            if line.startswith("[") and len(line) >= 7 and line[6] == "]":
+                if line[:7] > marker_time:
+                    unread_from = i
+                    break
+        win._unread_from = unread_from
+        win._wrap_dirty = True
+        if win is self.get_current_window():
+            self._chat_dirty = True
+            self.dirty = True
+
     async def _ev_ai_score(self, event):
         _, nick, rolling_ai = event
+        old_score = self.user_ai_scores.get(nick)
         self.user_ai_scores[nick] = rolling_ai
+        was_suspect = nick in self._suspect_nicks
         if rolling_ai >= self.ai_suspect_threshold:
             self._suspect_nicks.add(nick)
             self._dashboard_dirty = True
         else:
             self._suspect_nicks.discard(nick)
-        self._userlist_dirty = True
-        self.dirty = True
+        is_suspect = nick in self._suspect_nicks
+        if old_score != rolling_ai or was_suspect != is_suspect:
+            self._userlist_dirty = True
+            self.dirty = True
+        if was_suspect != is_suspect:
+            # Suspect set changed — chat must repaint to apply/remove bold highlighting
+            self._chat_dirty = True
+            self.dirty = True
 
     async def _ev_notice(self, event):
-        _, sender, target, text, *_extra = event
-        ts_str = _extra[0] if _extra else None
+        _, sender, target, text = event
         if sender.lower() in self.ignored_nicks:
             return
         win = self.ensure_window(target, is_channel=target.startswith("#"))
-        win.add_line(f"-{sender}- {text}", ts_str=ts_str)
+        win.add_line(f"-{sender}- {text}")
         if win is not self.get_current_window():
             self._unread_windows.add(target)
             self._input_dirty = True
@@ -4618,8 +5290,7 @@ class TUI:
         self.dirty = True
 
     async def _ev_nick_change(self, event):
-        _, old_nick, new_nick, *_extra = event
-        ts_str = _extra[0] if _extra else None
+        _, old_nick, new_nick = event
         for ch, users in self.channel_users.items():
             if old_nick in users:
                 users.discard(old_nick)
@@ -4633,7 +5304,7 @@ class TUI:
             self._suspect_nicks.discard(old_nick)
             if score >= self.ai_suspect_threshold:
                 self._suspect_nicks.add(new_nick)
-        self._status_win().add_line(f"* {old_nick} is now known as {new_nick}", ts_str=ts_str)
+        self._status_win().add_line(f"* {old_nick} is now known as {new_nick}")
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
 
@@ -4649,6 +5320,23 @@ class TUI:
         self._userlist_dirty = True
         self.dirty = True
 
+    async def _ev_names_status(self, event):
+        # Render channel_users[channel] to the *status* window in a compact
+        # wrapped layout.  Triggered by 366 only when the user invoked /names.
+        _, channel = event
+        users = sorted(self.channel_users.get(channel, set()), key=str.lower)
+        sw = self._status_win()
+        total = len(users)
+        sw.add_line(f"── /names {channel}  ({total} user{'s' if total != 1 else ''}) ──")
+        if not users:
+            sw.add_line("  (no users)")
+        else:
+            per_line = 6
+            for i in range(0, total, per_line):
+                sw.add_line("  " + "  ".join(f"{n:<14}" for n in users[i:i + per_line]).rstrip())
+        self._chat_dirty = True
+        self.dirty = True
+
     async def _ev_clear_users(self, event):
         for users in self.channel_users.values():
             users.clear()
@@ -4657,23 +5345,17 @@ class TUI:
         self.dirty = True
 
     async def _ev_topic(self, event):
-        _, channel, topic_text, *_extra = event
-        ts_str   = _extra[0] if len(_extra) > 0 else None
-        setter   = _extra[1] if len(_extra) > 1 else ""
-        by_str   = f" (set by {setter})" if setter else ""
-        text = (f"* Topic for {channel}{by_str}: {topic_text}"
+        _, channel, topic_text = event
+        text = (f"* Topic for {channel}: {topic_text}"
                 if topic_text else f"* No topic set for {channel}")
         wk = self._wk(self._active_server_id, channel)
         target_win = self.window_by_name.get(wk) or self._status_win()
-        target_win.add_line(text, ts_str=ts_str)
+        target_win.add_line(text)
         self._chat_dirty = True
         self.dirty = True
 
     async def _ev_join(self, event):
-        _, nick, channel, *_extra = event
-        ts_str   = _extra[0] if len(_extra) > 0 else None
-        account  = _extra[1] if len(_extra) > 1 else ""
-        realname = _extra[2] if len(_extra) > 2 else ""
+        _, nick, channel = event
         win = self.ensure_window(channel)
         if nick == self._active_client().nick:
             self.channel_users[channel] = set()
@@ -4682,8 +5364,7 @@ class TUI:
             if channel in self.channel_users:
                 self.channel_users[channel].add(nick)
                 self._sorted_users.pop(channel, None)
-            acc_str = f" [{account}]" if account else ""
-            win.add_line(f"* {nick}{acc_str} has joined {channel}", ts_str=ts_str)
+            win.add_line(f"* {nick} has joined {channel}")
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
 
@@ -4694,6 +5375,10 @@ class TUI:
         self.current_channel = channel
         self.current_window_index = self.windows.index(win)
         self._unread_windows.discard(channel)
+        # Fetch stored read marker from server if supported
+        client = self._active_client()
+        if "read-marker" in client._active_caps:
+            client.send_raw(f"MARKREAD {channel} *")
         self._chat_dirty = self._userlist_dirty = self._input_dirty = True
         self.dirty = True
 
@@ -4711,17 +5396,14 @@ class TUI:
         self.dirty = True
 
     async def _ev_part(self, event):
-        _, nick, channel, *_extra = event
-        ts_str = _extra[0] if len(_extra) > 0 else None
-        reason = _extra[1] if len(_extra) > 1 else ""
+        _, nick, channel = event
         if channel in self.channel_users:
             self.channel_users[channel].discard(nick)
             self._sorted_users.pop(channel, None)
         self._suspect_nicks.discard(nick)
         ch_win = self.window_by_name.get(self._wk(self._active_server_id, channel))
         if ch_win:
-            part_msg = f"* {nick} has left {channel}" + (f" ({reason})" if reason else "")
-            ch_win.add_line(part_msg, ts_str=ts_str)
+            ch_win.add_line(f"* {nick} has left {channel}")
             if ch_win is not self.get_current_window():
                 self._unread_windows.add(ch_win.name)
                 self._input_dirty = True
@@ -4729,8 +5411,7 @@ class TUI:
         self.dirty = True
 
     async def _ev_quit(self, event):
-        _, nick, reason, *_extra = event
-        ts_str   = _extra[0] if _extra else None
+        _, nick, reason = event
         quit_msg = f"* {nick} has quit" + (f" ({reason})" if reason else "")
         for ch, users in self.channel_users.items():
             if nick in users:
@@ -4738,7 +5419,7 @@ class TUI:
                 self._sorted_users.pop(ch, None)
                 ch_win = self.window_by_name.get(self._wk(self._active_server_id, ch))
                 if ch_win:
-                    ch_win.add_line(quit_msg, ts_str=ts_str)
+                    ch_win.add_line(quit_msg)
                     if ch_win is not self.get_current_window():
                         self._unread_windows.add(ch_win.name)
                         self._input_dirty = True
@@ -4748,66 +5429,9 @@ class TUI:
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
 
-    async def _ev_quit_silent(self, event):
-        """State-only quit update — used for netsplit batch aggregation."""
-        _, nick = event[0], event[1] if len(event) > 1 else ""
-        for ch, users in self.channel_users.items():
-            if nick in users:
-                users.discard(nick)
-                self._sorted_users.pop(ch, None)
-        self._suspect_nicks.discard(nick)
-        self.user_scores.pop(nick, None)
-        self.user_ai_scores.pop(nick, None)
-        self._userlist_dirty = True
-        self.dirty = True
-
-    async def _ev_join_silent(self, event):
-        """State-only join update — used for netjoin batch aggregation."""
-        _, nick, channel = event[0], event[1] if len(event) > 1 else "", event[2] if len(event) > 2 else ""
-        if channel in self.channel_users:
-            self.channel_users[channel].add(nick)
-            self._sorted_users.pop(channel, None)
-            self._userlist_dirty = True
-            self.dirty = True
-
-    async def _ev_kick(self, event):
-        # ("kick", kicker, channel, kicked_nick, reason, ts_str)
-        _, kicker, channel, kicked, reason, *_extra = event
-        ts_str = _extra[0] if _extra else None
-        reason_str = f" ({reason})" if reason else ""
-        msg = f"* {kicked} was kicked from {channel} by {kicker}{reason_str}"
-        wk = self._wk(self._active_server_id, channel)
-        win = self.window_by_name.get(wk) or self._status_win()
-        win.add_line(msg, ts_str=ts_str)
-        if win is not self.get_current_window():
-            self._unread_windows.add(win.name)
-            self._input_dirty = True
-        if kicked == self._active_client().nick:
-            if channel in self.channel_users:
-                self.channel_users[channel].clear()
-        elif channel in self.channel_users:
-            self.channel_users[channel].discard(kicked)
-            self._sorted_users.pop(channel, None)
-        self._chat_dirty = self._userlist_dirty = True
-        self.dirty = True
-
-    async def _ev_mode(self, event):
-        # ("mode", setter, params_list, ts_str)
-        _, setter, mode_params, *_extra = event
-        ts_str = _extra[0] if _extra else None
-        target = mode_params[0] if mode_params else ""
-        modes  = " ".join(mode_params[1:]) if len(mode_params) > 1 else ""
-        msg = f"* {setter} sets mode {modes} on {target}" if modes else f"* {setter} sets mode on {target}"
-        wk  = self._wk(self._active_server_id, target)
-        win = self.window_by_name.get(wk) or self._status_win()
-        win.add_line(msg, ts_str=ts_str)
-        self._chat_dirty = True
-        self.dirty = True
-
     async def _ev_status_line(self, event):
-        msg    = str(event[1]) if len(event) > 1 else str(event)
-        ts_str = event[2] if len(event) > 2 else None
-        self._status_win().add_line(msg, ts_str=ts_str)
+        msg = str(event[1]) if len(event) > 1 else str(event)
+        self._status_win().add_line(msg)
         self._chat_dirty = True
         self.dirty = True
 
@@ -4847,6 +5471,7 @@ class TUI:
         h["who"]        = self._slash_who
         h["whowas"]     = self._slash_whowas
         h["names"]      = self._slash_names
+        h["isactive"]   = self._slash_isactive
         h["ignore"]     = self._slash_ignore
         h["unignore"]   = self._slash_unignore
         h["clear"]      = self._slash_clear
@@ -4874,8 +5499,12 @@ class TUI:
         h["monitor"]      = self._slash_monitor
         h["whox"]         = self._slash_whox
         h["tagmsg"]       = self._slash_tagmsg
-        h["knock"]        = self._slash_knock
-        h["markread"]     = self._slash_markread
+        h["reply"]        = self._slash_reply
+        h["react"]        = self._slash_react
+        h["ml"] = h["multiline"] = self._slash_multiline
+        h["redact"]       = self._slash_redact
+        h["register"]     = self._slash_register
+        h["pem"]          = self._slash_pem
 
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
@@ -4978,6 +5607,8 @@ class TUI:
             self._active_client().cmd_service("ChanServ", args)
 
     async def _slash_ai(self, args, extra, line):
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[ai] disabled by --no-ai")); return
         if args:
             await self.show_user_ai_profile(args)
         else:
@@ -4990,6 +5621,8 @@ class TUI:
 
     async def _slash_bot(self, args, extra, line):
         """Mark a nick as a confirmed bot/AI and build a fingerprint from history."""
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[bot] disabled by --no-ai")); return
         nick = args.strip()
         if not nick:
             await self.ui_queue.put(("status", "Usage: /bot <nick>  —  mark as confirmed bot/AI"))
@@ -5027,6 +5660,8 @@ class TUI:
 
     async def _slash_unbot(self, args, extra, line):
         """Remove confirmed-bot status from a nick."""
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[unbot] disabled by --no-ai")); return
         nick = args.strip()
         if not nick:
             await self.ui_queue.put(("status", "Usage: /unbot <nick>"))
@@ -5043,6 +5678,8 @@ class TUI:
         await self.ui_queue.put(("status", f"[bot] {nick} removed from confirmed-bot list"))
 
     async def _slash_topai(self, args, extra, line):
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[topai] disabled by --no-ai")); return
         cur_win = self.get_current_window()
         channel = cur_win.name if cur_win.name.startswith("#") else self.current_channel or ""
         if not channel or channel not in self.channel_users:
@@ -5116,6 +5753,8 @@ class TUI:
         self.dirty                     = True
 
     async def _slash_aitoggle(self, args, extra, line):
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[aitoggle] disabled by --no-ai")); return
         detector = self._active_client().scoring.ai_detector
         detector.enabled = not detector.enabled
         det_state = "ENABLED" if detector.enabled else "DISABLED"
@@ -5123,6 +5762,8 @@ class TUI:
         await self.ui_queue.put(("status", f"AI detection {det_state}  ({log_state})"))
 
     async def _slash_logtoggle(self, args, extra, line):
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[logtoggle] disabled by --no-ai")); return
         global _ai_logging_enabled
         # Write a final "disabled" record before we stop writing, or a "enabled" record
         # immediately after we start — so the log gap is bounded and auditable.
@@ -5149,12 +5790,16 @@ class TUI:
 
     async def _slash_msg(self, args, extra, line):
         if args and extra:
-            self._active_client().cmd_msg(args, extra)
-            win = self.ensure_window(args, is_channel=False)
-            win.add_line(f"<{self._active_client().nick}> {extra}")
+            result = self._active_client().cmd_msg(args, extra)
+            is_chan = args.startswith("#")
+            win = self.ensure_window(args, is_channel=is_chan)
             self.current_window_index = self.windows.index(win)
             self.current_channel = args
             self._unread_windows.discard(args)
+            if result:
+                await self.ui_queue.put(result)
+            else:
+                win.add_line(f"<{self._active_client().nick}> {extra}")
             self._chat_dirty = self._userlist_dirty = self._input_dirty = True
             self.dirty = True
         else:
@@ -5172,8 +5817,11 @@ class TUI:
             if is_new:
                 win.add_line(f"** Query with {args} opened **", timestamp=False)
             if extra:
-                self._active_client().cmd_msg(args, extra)
-                win.add_line(f"<{self._active_client().nick}> {extra}")
+                result = self._active_client().cmd_msg(args, extra)
+                if result:
+                    await self.ui_queue.put(result)
+                else:
+                    win.add_line(f"<{self._active_client().nick}> {extra}")
         else:
             await self.ui_queue.put(("status", "Usage: /query <nick> [message]"))
 
@@ -5245,7 +5893,227 @@ class TUI:
             self._active_client().cmd_whowas(args)
 
     async def _slash_names(self, args, extra, line):
-        self._active_client().cmd_names(args or self.current_channel or "")
+        c = self._active_client()
+        channel = (args or self.current_channel or "").strip()
+        if not channel:
+            await self.ui_queue.put(("status",
+                "Usage: /names [channel]  (no current channel)"))
+            return
+        c._names_to_status.add(channel)
+        c.cmd_names(channel)
+
+    async def _slash_isactive(self, args, extra, line):
+        """Show what % of /names members have spoken in the channel.
+
+        Usage: /isactive [channel] [window]
+          window = N{s|m|h|d|w}  (e.g. 7d, 24h, 90m, 2w; bare N defaults to days)
+          /isactive ##anime 7d   → only counts activity in the last 7 days
+          /isactive 7d           → uses the current channel
+          /isactive ##anime      → all-time
+
+        Activity sources:
+          • UserState.total_msgs / last_msg_time  (this session, exact wall-clock)
+          • chat_logs/<channel>.log  (message-author lines: "<nick>" or "* nick")
+
+        Time-windowed log scanning has no date stamps to work with — only
+        [HH:MM] per line — so it walks backward from EOF using the file's
+        mtime as anchor, decrementing the day each time the timestamp jumps
+        forward (i.e. crosses midnight going backwards). [↑] replay lines
+        carry server-time HH:MM (not append time) so they break monotonicity
+        and are skipped during windowed walks; they're still counted all-time."""
+        # ── Parse args ───────────────────────────────────────────────────────
+        win_re = re.compile(r'^(\d+)([smhdw]?)$', re.I)
+        unit_secs = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+        def _parse_window(tok: str):
+            m = win_re.match(tok or "")
+            if not m:
+                return None
+            return float(int(m.group(1)) * unit_secs[(m.group(2) or "d").lower()])
+
+        toks = (args or "").strip().split()
+        channel = ""
+        window = None  # seconds, or None for all-time
+        if not toks:
+            channel = self.current_channel or ""
+        elif len(toks) == 1:
+            w = _parse_window(toks[0])
+            if w is not None:
+                channel = self.current_channel or ""
+                window = w
+            else:
+                channel = toks[0]
+        else:
+            channel = toks[0]
+            window = _parse_window(toks[1])
+            if window is None:
+                await self.ui_queue.put(("status",
+                    f"/isactive: bad window '{toks[1]}' — expected like 7d, 24h, 90m, 2w"))
+                return
+
+        if not channel:
+            await self.ui_queue.put(("status",
+                "Usage: /isactive [channel] [window]   window = 7d 24h 90m 2w"))
+            return
+        members = self.channel_users.get(channel, set())
+        if not members:
+            await self.ui_queue.put(("status",
+                f"/isactive: no members cached for {channel} — run /names {channel} first"))
+            return
+
+        # ── Build the "has-spoken" set from chat log + present session ───────
+        client = self._active_client()
+        members_lower = {n.lower(): n for n in members}
+        spoken_lower: set = set()
+        now_ts = time.time()
+        cutoff = (now_ts - window) if window is not None else None
+        # Present chat — anyone the IRC client has seen send a message
+        for nick, state in client.users.items():
+            nlow = nick.lower()
+            if nlow not in members_lower or state.total_msgs <= 0:
+                continue
+            if cutoff is None:
+                spoken_lower.add(nlow)
+            elif state.last_msg_time is not None and state.last_msg_time >= cutoff:
+                spoken_lower.add(nlow)
+        # Historical logs — scan for "<nick>" or "* nick" message-author lines.
+        # Optional "[↑] " replay marker and "[account]" tag may sit between
+        # the timestamp and the nick.
+        log_path = _chat_log_path(channel)
+        line_re = re.compile(r'^\[(\d{2}):(\d{2})\](\s\[↑\])?\s(?:<([^>\s]+)>|\*\s+(\S+))')
+        log_present_lower: set = set()
+        loop = asyncio.get_running_loop()
+        def _scan_all() -> set:
+            found: set = set()
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    for ln in f:
+                        m = line_re.match(ln)
+                        if not m:
+                            continue
+                        nm = (m.group(4) or m.group(5) or "").strip()
+                        low = nm.lower()
+                        if low in members_lower:
+                            found.add(low)
+                            if len(found) == len(members_lower):
+                                break
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+            return found
+        def _scan_windowed(cutoff_ts: float) -> set:
+            from datetime import datetime, timedelta
+            found: set = set()
+            try:
+                mtime = os.path.getmtime(log_path)
+            except (FileNotFoundError, OSError):
+                return found
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                return found
+            except Exception:
+                return found
+            mtime_dt = datetime.fromtimestamp(mtime)
+            cur_date = mtime_dt.date()
+            # Seed prev_minutes with the file mtime so a last-line near midnight
+            # doesn't accidentally trigger a rollback on the first iteration.
+            prev_minutes = mtime_dt.hour * 60 + mtime_dt.minute
+            for ln in reversed(lines):
+                m = line_re.match(ln)
+                if not m:
+                    continue
+                # Skip CHATHISTORY replay lines: their [HH:MM] is server-time,
+                # not append time, so they'd corrupt the day-rollback walk.
+                if m.group(3):
+                    continue
+                hh = int(m.group(1)); mm = int(m.group(2))
+                cur_minutes = hh * 60 + mm
+                if cur_minutes > prev_minutes:
+                    cur_date -= timedelta(days=1)
+                prev_minutes = cur_minutes
+                line_ts = datetime.combine(
+                    cur_date, datetime.min.time().replace(hour=hh, minute=mm)
+                ).timestamp()
+                if line_ts < cutoff_ts:
+                    break
+                nm = (m.group(4) or m.group(5) or "").strip()
+                low = nm.lower()
+                if low in members_lower:
+                    found.add(low)
+                    if len(found) == len(members_lower):
+                        break
+            return found
+        try:
+            if cutoff is None:
+                log_present_lower = await loop.run_in_executor(None, _scan_all)
+            else:
+                log_present_lower = await loop.run_in_executor(
+                    None, lambda: _scan_windowed(cutoff))
+        except Exception:
+            log_present_lower = set()
+        active_lower = spoken_lower | log_present_lower
+        active_count = len(active_lower)
+        total = len(members)
+        pct = (active_count / total * 100.0) if total else 0.0
+
+        # Render the window as the largest exact unit it divides into
+        if window is None:
+            win_label = ""
+        else:
+            for unit, secs in (("w", 604800), ("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
+                if window % secs == 0:
+                    win_label = f"  (last {int(window // secs)}{unit})"
+                    break
+
+        # ── Render to dashboard ─────────────────────────────────────────────
+        dash = self.window_by_name["*dashboard*"]
+        dash.lines.clear()
+        dash._wrap_dirty = True
+        L = lambda t: dash.add_line(t, timestamp=False)
+        bar_full = int(round(pct / 5))         # 20-cell bar, each cell = 5%
+        bar = "█" * bar_full + "░" * (20 - bar_full)
+        L(f"=== /isactive  {channel}{win_label} ===")
+        L("")
+        L(f"  Active:      {active_count} / {total} users")
+        L(f"  Percentage:  [{bar}]  {pct:5.1f}%")
+        L("")
+        L(f"  Source breakdown:")
+        L(f"    present chat (this session): {len(spoken_lower):4d}")
+        L(f"    historical logs:             {len(log_present_lower):4d}")
+        L(f"    union (counts once per nick): {active_count:4d}")
+        L("")
+        # Show the 30 most recently/likely active nicks
+        if active_lower:
+            sample = sorted(members_lower[k] for k in active_lower)[:30]
+            L(f"  Active nicks (first {len(sample)}):")
+            for i in range(0, len(sample), 6):
+                L("    " + "  ".join(f"{n:<14}" for n in sample[i:i + 6]).rstrip())
+            if active_count > len(sample):
+                L(f"    … and {active_count - len(sample)} more")
+            L("")
+        # Show inactive nicks too — they're the more interesting set for AI sweeps
+        inactive_lower = set(members_lower) - active_lower
+        if inactive_lower:
+            sample = sorted(members_lower[k] for k in inactive_lower)[:30]
+            inact_label = "no msgs in window" if window is not None else "no messages on record"
+            L(f"  Inactive nicks ({inact_label}, first {len(sample)}):")
+            for i in range(0, len(sample), 6):
+                L("    " + "  ".join(f"{n:<14}" for n in sample[i:i + 6]).rstrip())
+            if len(inactive_lower) > len(sample):
+                L(f"    … and {len(inactive_lower) - len(sample)} more")
+        L("")
+        L(f"  Denominator from /names cache for {channel}.  "
+          f"Run /names {channel} to refresh.")
+
+        self.current_window_index      = 1   # *dashboard*
+        self._chat_dirty               = True
+        self._dashboard_dirty          = False
+        self._dashboard_last_update    = time.monotonic()
+        self._dashboard_mode           = "profile"
+        self._dashboard_profile_locked = True
+        self.dirty                     = True
 
     async def _slash_ignore(self, args, extra, line):
         if args:
@@ -5260,16 +6128,34 @@ class TUI:
     async def _slash_clear(self, args, extra, line):
         win = self.get_current_window()
         win.lines.clear()
+        win._line_msgids.clear()
+        win._msg_store.clear()
+        win._reactions.clear()
+        win._last_msgid = ""
+        win._unread_from = -1
+        win.scroll_offset = 0
         win._wrap_dirty = True
+        self._chat_dirty = True
+        self.dirty = True
 
     async def _slash_close(self, args, extra, line):
         win = self.get_current_window()
         if win.name not in ("*status*", "*dashboard*"):
             self._unread_windows.discard(win.name)
+            idx = self.current_window_index
             self.windows.remove(win)
             wk = self._wk(win.server_id or self._primary_server_id, win.name)
             self.window_by_name.pop(wk, None)
-            self.current_window_index = max(0, self.current_window_index - 1)
+            # After removal, windows after `idx` shift down by 1, so staying at
+            # `idx` lands on the next window. Drop to last only if we were last.
+            self.current_window_index = min(idx, len(self.windows) - 1)
+            log_key = win._log_name or win.name
+            handle = _chat_log_handles.pop(log_key, None)
+            if handle and not handle.closed:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
             new_win = self.get_current_window()
             if new_win.name not in ("*status*", "*dashboard*"):
                 self.current_channel = new_win.name
@@ -5280,6 +6166,7 @@ class TUI:
         if args.isdigit():
             idx = int(args) - 1
             if 0 <= idx < len(self.windows):
+                self._mark_window_read(self.get_current_window())
                 self.current_window_index = idx
                 win = self.windows[idx]
                 if win.name not in ("*status*", "*dashboard*"):
@@ -5287,6 +6174,7 @@ class TUI:
                 if win.name in self._unread_windows:
                     win.scroll_offset = 0
                 self._unread_windows.discard(win.name)
+                win._unread_from = -1
                 self._chat_dirty = self._userlist_dirty = self._input_dirty = True
                 self.dirty = True
 
@@ -5365,7 +6253,9 @@ class TUI:
         # Create a dedicated status window for this server.
         sw_wk = self._wk(new_sid, "*status*")
         sw    = ChatWindow("*status*", is_channel=False, server_id=new_sid)
-        sw._persist = False
+        # Persist to a per-server filename so secondary servers' status
+        # streams aren't collapsed into the primary's _status_.log.
+        sw._log_name = f"*status*-{new_sid}"
         self.windows.append(sw)
         self.window_by_name[sw_wk] = sw
         self.current_window_index = self.windows.index(sw)
@@ -5409,6 +6299,8 @@ class TUI:
                 f"Usage: /theme <1-{len(THEMES)}>  {names}  (current: {self.current_theme})"))
 
     async def _slash_askai(self, args, extra, line):
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[askai] disabled by --no-ai")); return
         rest = line[len("/askai"):].strip()
         if not rest:
             keys = " | ".join(AI_MODELS)
@@ -5439,6 +6331,8 @@ class TUI:
           n      – number of most-recent messages to include (default 50, max 200)
           model  – any key from /model  (e.g. sonnet, gpt4o)
         """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[summarize] disabled by --no-ai")); return
         if self._askai_pending:
             await self.ui_queue.put(("status", "/summarize already in progress, please wait…"))
             return
@@ -5525,10 +6419,15 @@ class TUI:
                              speakers: list) -> None:
         answer, tokens = "", "?"
         try:
+            # 2000 output tokens fits the 4-section structured summary even on
+            # busy channels (200 msgs, many speakers); 800 was getting truncated
+            # mid-sentence and dropping the "Conclusions" section.  Timeout
+            # bumped to 180s to give slower local models headroom for the
+            # larger response.
             answer, tokens = await asyncio.wait_for(
-                self._call_ai(prompt, model_key, max_tokens=800), timeout=120.0)
+                self._call_ai(prompt, model_key, max_tokens=2000), timeout=180.0)
         except asyncio.TimeoutError:
-            answer, tokens = "[error] AI request timed out after 120 s", "?"
+            answer, tokens = "[error] AI request timed out after 180 s", "?"
         except Exception as exc:
             answer, tokens = f"[error] {exc}", "?"
         finally:
@@ -5569,6 +6468,10 @@ class TUI:
                     avail = "  (ANTHROPIC_API_KEY not set)"
                 elif spec["provider"] == "openai" and not OPENAI_API_KEY:
                     avail = "  (OPENAI_API_KEY not set)"
+                elif spec["provider"] == "deepseek" and not DEEPSEEK_API_KEY:
+                    avail = "  (DEEPSEEK_API_KEY not set)"
+                elif spec["provider"] == "copilot" and not GITHUB_TOKEN:
+                    avail = "  (GITHUB_TOKEN not set)"
                 sw.add_line(f"  {chat_mark}{det_mark} {k:<8} {spec['label']:<22} [{spec['provider']}]{avail}")
             sw.add_line("  > = chat model   D = also used for AI detection")
             sw.add_line(f"  Usage: /model <key>   current: {self.ai_chat_model}")
@@ -5588,8 +6491,8 @@ class TUI:
                 f"Unknown model '{key}'. Available: {keys}  (current: {self.ai_chat_model})"))
 
     async def _slash_api(self, args, extra, line):
-        global ANTHROPIC_API_KEY, OPENAI_API_KEY, OLLAMA_URL, LLAMACPP_URL
-        _KNOWN = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OLLAMA_URL", "LLAMACPP_URL"}
+        global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GITHUB_TOKEN, OLLAMA_URL, LLAMACPP_URL
+        _KNOWN = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "GITHUB_TOKEN", "OLLAMA_URL", "LLAMACPP_URL"}
 
         if not args:
             sw = self._status_win()
@@ -5606,6 +6509,8 @@ class TUI:
             rows = [
                 ("Claude",    "ANTHROPIC_API_KEY", ANTHROPIC_API_KEY, "console.anthropic.com"),
                 ("OpenAI",    "OPENAI_API_KEY",    OPENAI_API_KEY,    "platform.openai.com"),
+                ("DeepSeek",  "DEEPSEEK_API_KEY",  DEEPSEEK_API_KEY,  "platform.deepseek.com"),
+                ("Copilot",   "GITHUB_TOKEN",       GITHUB_TOKEN,      "github.com/settings/tokens"),
                 ("Ollama",    "OLLAMA_URL",         OLLAMA_URL,        "local server — no key needed"),
                 ("llama.cpp", "LLAMACPP_URL",       LLAMACPP_URL,      "local server — no key needed"),
             ]
@@ -5636,6 +6541,12 @@ class TUI:
                 OPENAI_API_KEY = value
                 if _openai_mod is not None:
                     _openai_mod.api_key = value
+            elif var_name == "DEEPSEEK_API_KEY":
+                DEEPSEEK_API_KEY = value
+                self._deepseek_client = None   # force reconnect with new key
+            elif var_name == "GITHUB_TOKEN":
+                GITHUB_TOKEN = value
+                self._copilot_client = None    # force reconnect with new key
             elif var_name == "OLLAMA_URL":
                 OLLAMA_URL = value
             elif var_name == "LLAMACPP_URL":
@@ -5646,7 +6557,7 @@ class TUI:
             return
 
         await self.ui_queue.put(("status",
-            f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  OLLAMA_URL  LLAMACPP_URL"))
+            f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  DEEPSEEK_API_KEY  GITHUB_TOKEN  OLLAMA_URL  LLAMACPP_URL"))
 
     async def _slash_mute(self, args, extra, line):
         self.mention_beep_muted = not self.mention_beep_muted
@@ -5669,19 +6580,26 @@ class TUI:
         _C("  ╚" + "═" * 44 + "╝")
         _C("")
         _H("Messaging")
-        _E("/msg <nick> <text>",            "Send a PM; opens and switches to the DM window")
+        _E("/msg (/m) <nick> <text>",       "Send a PM; opens and switches to the DM window")
         _E("/query <nick> [message]",       "Open a DM window with nick; optionally send a first message")
         _E("/notice <nick> <text>",         "Send a notice (-nick- style, not shown in chat)")
-        _E("/me <text>",                    "Send an action line  (* nick waves)")
+        _E("/me (/action) <text>",          "Send an action line  (* nick waves)")
+        _E("/reply <text>",                 "Reply to last message with +reply tag (IRCv3 message-tags)")
+        _E("/react <emoji>",                "React to last message with +react TAGMSG (IRCv3 message-tags)")
+        _E("/ml (/multiline) <l1> | <l2>…", "Send multiline message via draft/multiline batch")
+        _E("/redact [reason]",              "Redact last message in this window (message-redaction)")
+        _E("/tagmsg <target> k=v[;k2=v2]",  "Send a TAGMSG with client-only tags to target")
         _C("")
         _H("Channels")
         _E("/join <channel>",               "Join a channel (# is added automatically if omitted)")
         _E("/part [channel] [message]",     "Leave a channel with an optional part message")
         _E("/topic <channel> [text]",       "View or set the channel topic")
-        _E("/names [channel]",              "List users currently in the channel")
+        _E("/names [channel]",              "List users currently in the channel — output to *status*")
+        _E("/isactive [chan] [window]",     "% of /names members who spoke in window (e.g. 7d, 24h, 90m, 2w). All-time if omitted")
         _E("/kick <chan> <nick> [reason]",  "Kick a user from the channel")
         _E("/invite <nick> [channel]",      "Invite a user to a channel")
         _E("/mode <target> [modes]",        "Get or set channel / user modes")
+        _E("/replay [n|on|off]",            "Fetch n msgs of channel history via CHATHISTORY (default 50)")
         _C("")
         _H("Operator")
         _E("/op <nick>",    "Grant operator status  (+o)")
@@ -5698,15 +6616,19 @@ class TUI:
         _E("/whois <nick>",                 "Look up user info — shown formatted in *status*")
         _E("/whowas <nick>",                "Info on a recently disconnected user")
         _E("/who <target>",                 "List users matching a pattern")
+        _E("/whox [target] [fields]",       "WHOX query for target (default current channel; fields hnuraf)")
+        _E("/monitor +|- nicks | list…",    "MONITOR nicks for online/offline (+/add, -/del, list, clear, status)")
         _E("/ignore <nick>",                "Suppress all messages from nick")
         _E("/unignore <nick>",              "Stop ignoring nick")
         _E("/away [message]",               "Set away status with optional message")
         _E("/back",                         "Remove away status")
         _C("")
-        _H("Services & CTCP")
-        _E("/ns <command>",                 "Send command to NickServ  (e.g. /ns identify pw)")
-        _E("/cs <command>",                 "Send command to ChanServ")
+        _H("Services & Account")
+        _E("/ns (/nickserv) <command>",     "Send command to NickServ  (e.g. /ns identify pw)")
+        _E("/cs (/chanserv) <command>",     "Send command to ChanServ")
         _E("/ctcp <nick> <cmd> [args]",     "Send a CTCP request  (PING VERSION TIME …)")
+        _E("/register <acct|*> <email> <pw>","Register account via draft/account-registration (* = current nick)")
+        _E("/pem [path]",                   "Generate SASL ECDSA P-256 keypair, set PUBKEY in NickServ, update config")
         _C("")
         _H("AI Detection")
         _E("/ai <nick>",                    "Full AI profile: score, idle, sparkline, verdict")
@@ -5734,11 +6656,12 @@ class TUI:
         _C("")
         _H("Windows & Navigation")
         _C("  Tab bar (above input): [1:status] [2:dash] [*3:##chat]  * = unread")
-        _E("/win <n>",    "Switch to window n; clears its unread marker")
-        _E("/close  (or /wc)", "Close current window; focus moves to previous")
-        _E("/clear",     "Clear messages in the current window")
-        _E("/theme <1-5>","Switch colour theme: Classic Hacker Ocean Sunset Neon")
-        _E("/userlist",   "Toggle the user list panel on/off")
+        _E("/win (/window) <n>", "Switch to window n; clears its unread marker")
+        _E("/close (/wc)",       "Close current window; focus moves to previous")
+        _E("/clear",             "Clear messages in the current window")
+        _E("/theme <1-5>",       "Switch colour theme: Classic Hacker Ocean Sunset Neon")
+        _E("/userlist",          "Toggle the user list panel on/off")
+        _E("/mute",              "Toggle mention beep on/off (highlight stays active)")
         _C("  Ctrl+N  next window    Tab  nick completion    PgUp/PgDn  scroll")
         _C("  Ctrl+A/E  line start/end    Ctrl+K  kill to end    Ctrl+W  delete word")
         _C("  Ctrl+B/]/_ bold/italic/underline    Ctrl+O  reset formatting")
@@ -5751,9 +6674,9 @@ class TUI:
         _C("")
         _H("General")
         _E("/redraw [channel]",   "Force full screen repaint and reload userlist from server")
-        _E("/quit [message]", "Send quit message and exit")
-        _E("/help",           "Brief one-line command reference")
-        _E("/commands",       "This full command list")
+        _E("/quit (/exit) [msg]", "Send quit message and exit")
+        _E("/help",               "Brief one-line command reference")
+        _E("/commands",           "This full command list")
         _C("")
         self.current_window_index = 0
         self._chat_dirty = True
@@ -5768,7 +6691,7 @@ class TUI:
             "── Channels ──────────────────────────────────────────────",
             "  /join <chan>  /part [chan] [msg]  /topic <chan> [text]",
             "  /kick <chan> <nick> [reason]  /invite <nick> [chan]",
-            "  /names [chan]  /mode <target> [modes]",
+            "  /names [chan]  /isactive [chan] [window]  /mode <target> [modes]",
             "── Operator ──────────────────────────────────────────────",
             "  /op /deop /voice /devoice /hop /dehop  /ban /unban",
             "── Users ─────────────────────────────────────────────────",
@@ -5891,27 +6814,179 @@ class TUI:
         c.cmd_tagmsg(target, tags)
         await self.ui_queue.put(("status", f"[tagmsg] sent to {target}: {tag_str}"))
 
-    async def _slash_knock(self, args, extra, line):
-        """Send a KNOCK to request entry to an invite-only channel."""
-        c = self._active_client()
-        parts = args.strip().split(None, 1)
-        if not parts:
-            await self.ui_queue.put(("status", "Usage: /knock <channel> [message]"))
+    async def _slash_reply(self, args, extra, line):
+        """Send a PRIVMSG with +reply tag referencing the last message in this window."""
+        slash_end = line.index(" ") + 1 if " " in line else len(line)
+        text = line[slash_end:].strip()
+        if not text:
+            await self.ui_queue.put(("status", "Usage: /reply <text>"))
             return
-        channel = parts[0]
-        message = parts[1] if len(parts) > 1 else ""
-        c.cmd_knock(channel, message)
-        await self.ui_queue.put(("status", f"Knocked on {channel}"))
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/reply: not in a chat window"))
+            return
+        if not win._last_msgid:
+            await self.ui_queue.put(("status",
+                "/reply: no msgid — server may not support message-tags"))
+            return
+        client = self._active_client()
+        client.send_tagged({"+reply": win._last_msgid}, f"PRIVMSG {win.name} :{text}")
+        ref = win._msg_store.get(win._last_msgid)
+        if ref:
+            ref_nick, ref_prev = ref
+            p = ref_prev[:50] + "…" if len(ref_prev) > 50 else ref_prev
+            win.add_line(f"  ↩ {ref_nick}: {p}", timestamp=False)
+        win.add_line(f"<{client.nick}> {text}")
+        self._chat_dirty = True
+        self.dirty = True
 
-    async def _slash_markread(self, args, extra, line):
-        """Mark the current channel as read up to the latest message."""
-        c = self._active_client()
-        target = args.strip() or self.current_channel or ""
-        if not target:
-            await self.ui_queue.put(("status", "Usage: /markread [channel]"))
+    async def _slash_react(self, args, extra, line):
+        """Send a +react TAGMSG to the last message in this window."""
+        emoji = args.strip()
+        if not emoji:
+            await self.ui_queue.put(("status", "Usage: /react <emoji>"))
             return
-        c.cmd_markread(target)
-        await self.ui_queue.put(("status", f"[markread] marked {target} as read"))
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/react: not in a chat window"))
+            return
+        if not win._last_msgid:
+            await self.ui_queue.put(("status",
+                "/react: no msgid — server may not support message-tags"))
+            return
+        client = self._active_client()
+        client.cmd_tagmsg(win.name, {"+react": emoji, "+reply": win._last_msgid})
+        nicks = win._reactions.setdefault(win._last_msgid, {}).setdefault(emoji, [])
+        if client.nick not in nicks:
+            nicks.append(client.nick)
+        win._wrap_dirty = True
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_multiline(self, args, extra, line):
+        """Send a multiline message using draft/multiline batch (| = line break)."""
+        slash_end = line.index(" ") + 1 if " " in line else len(line)
+        text_raw = line[slash_end:].strip()
+        if not text_raw:
+            await self.ui_queue.put(("status", "Usage: /ml <line1> | <line2> | ..."))
+            return
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/ml: not in a chat window"))
+            return
+        # Replace | separators with actual newlines
+        text = "\n".join(part.strip() for part in text_raw.split("|"))
+        client = self._active_client()
+        result = client.cmd_msg(win.name, text)
+        if result:
+            await self.ui_queue.put(result)
+
+    async def _slash_redact(self, args, extra, line):
+        """Redact the last message in this window (message-redaction CAP)."""
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/redact: not in a chat window"))
+            return
+        if not win._last_msgid:
+            await self.ui_queue.put(("status",
+                "/redact: no msgid — server may not support message-tags"))
+            return
+        reason = (args + (" " + extra if extra else "")).strip()
+        client = self._active_client()
+        if reason:
+            client.send_raw(f"REDACT {win.name} {win._last_msgid} :{reason}")
+        else:
+            client.send_raw(f"REDACT {win.name} {win._last_msgid}")
+
+    async def _slash_register(self, args, extra, line):
+        """Register a new account via draft/account-registration.
+
+        Usage: /register <account|*> <email> <password>
+        Use * as account to register the current nick as the account name.
+        """
+        c = self._active_client()
+        if "draft/account-registration" not in c._active_caps:
+            await self.ui_queue.put(("status",
+                "[register] server does not support draft/account-registration"))
+            return
+        parts = args.strip().split(None, 2)
+        if len(parts) < 3:
+            await self.ui_queue.put(("status",
+                "Usage: /register <account|*> <email> <password>"))
+            return
+        account, email, password = parts
+        c.send_raw(f"REGISTER {account} {email} :{password}")
+
+    async def _slash_pem(self, args, extra, line):
+        """Generate a NIST P-256 key pair for SASL ECDSA-NIST256P-CHALLENGE.
+
+        Saves the private key to a PEM file, sends the public key to NickServ
+        with SET PUBKEY, and updates irc_config.json to use the new key.
+
+        Usage: /pem [/path/to/output.pem]
+        Default path: <script_dir>/<nick>_sasl.pem
+        """
+        if not CRYPTOGRAPHY_AVAILABLE:
+            await self.ui_queue.put(("status",
+                "[pem] requires the 'cryptography' package — pip install cryptography"))
+            return
+
+        c = self._active_client()
+        key_path = args.strip() if args.strip() else \
+            os.path.join(os.getcwd(), f"{c.nick}_sasl.pem")
+
+        # Generate ECDSA P-256 key pair.
+        try:
+            private_key = _ecdsa_ec.generate_private_key(_ecdsa_ec.SECP256R1())
+        except Exception as exc:
+            await self.ui_queue.put(("status", f"[pem] key generation failed: {exc}"))
+            return
+
+        # Persist private key as unencrypted PKCS8 PEM.
+        try:
+            from cryptography.hazmat.primitives.serialization import (
+                Encoding, PrivateFormat, PublicFormat, NoEncryption,
+            )
+            pem_bytes = private_key.private_bytes(
+                encoding=Encoding.PEM,
+                format=PrivateFormat.PKCS8,
+                encryption_algorithm=NoEncryption(),
+            )
+            with open(key_path, "wb") as _kf:
+                _kf.write(pem_bytes)
+        except Exception as exc:
+            await self.ui_queue.put(("status", f"[pem] failed to save private key: {exc}"))
+            return
+
+        # Encode public key as base64 of the uncompressed EC point (0x04 || X || Y).
+        # This is the format Atheme NickServ expects for SET PUBKEY.
+        try:
+            pub_bytes = private_key.public_key().public_bytes(
+                encoding=Encoding.X962,
+                format=PublicFormat.UncompressedPoint,
+            )
+            pub_b64 = base64.b64encode(pub_bytes).decode()
+        except Exception as exc:
+            await self.ui_queue.put(("status", f"[pem] failed to encode public key: {exc}"))
+            return
+
+        # Send public key to NickServ.
+        c.cmd_service("NickServ", f"SET PUBKEY {pub_b64}")
+
+        # Persist key path and mechanism to irc_config.json so the next launch
+        # automatically uses ECDSA without manual env-var setup.
+        try:
+            _cfg = load_irc_config()
+            _cfg["sasl_key"]       = key_path
+            _cfg["sasl_mechanism"] = "ECDSA-NIST256P-CHALLENGE"
+            save_irc_config(_cfg)
+        except Exception:
+            pass
+
+        await self.ui_queue.put(("status", f"[pem] private key saved → {key_path}"))
+        await self.ui_queue.put(("status", f"[pem] public key sent to NickServ (SET PUBKEY)"))
+        await self.ui_queue.put(("status",
+            "[pem] irc_config.json updated: sasl_mechanism=ECDSA-NIST256P-CHALLENGE"))
 
     async def _slash_redraw(self, args, extra, line):
         channel = args.strip() or self.current_channel or ""
@@ -6156,9 +7231,7 @@ class TUI:
                 self.dirty = True
 
         elif ch == 9:    # Tab — nick completion
-            prev_len = len(self.input_buffer)
             self.do_nick_complete()
-            self.input_cursor += len(self.input_buffer) - prev_len
 
         elif ch == 3:    # Ctrl+C
             raise SystemExit
@@ -6234,6 +7307,37 @@ class TUI:
 
         return False
 
+    # ── IRCv3 outgoing +typing helpers ───────────────────────────────────────
+
+    def _typing_chat_target(self) -> str:
+        """Return the current chat target, or '' for non-chat windows."""
+        cur = self.get_current_window()
+        return "" if cur.name in ("*status*", "*dashboard*") else cur.name
+
+    def _send_typing(self, state: str) -> None:
+        """Send a +typing TAGMSG; update outgoing state bookkeeping."""
+        if state == "done":
+            target = self._typing_out_target
+        else:
+            target = self._typing_chat_target()
+        if not target:
+            return
+        c = self._active_client()
+        if "message-tags" not in c._active_caps:
+            return
+        c.cmd_tagmsg(target, {"+typing": state})
+        if state == "done":
+            self._typing_out_target = ""
+            self._typing_out_last   = 0.0
+            self._typing_out_state  = ""
+        elif state == "active":
+            self._typing_out_target = target
+            self._typing_out_last   = time.monotonic()
+            self._typing_out_state  = "active"
+        else:  # paused
+            self._typing_out_target = target
+            self._typing_out_state  = "paused"
+
     async def run(self) -> None:
         try:
             await self._run_loop()
@@ -6253,6 +7357,9 @@ class TUI:
                 had_key = True
                 is_enter = self._handle_key(ch)
                 if is_enter:
+                    # Send +typing=done *before* clearing the buffer.
+                    if self._typing_out_state in ("active", "paused"):
+                        self._send_typing("done")
                     line = self.input_buffer
                     if line.strip():
                         self.input_history.appendleft(line)
@@ -6265,6 +7372,18 @@ class TUI:
                     self.completion_state = None
                     self._input_dirty  = True
                     break  # redraw before consuming the next key
+
+            # ── 1b. Outgoing +typing notifications ────────────────────────────────
+            if had_key:
+                _new_tgt = self._typing_chat_target()
+                if _new_tgt != self._typing_out_target and self._typing_out_state in ("active", "paused"):
+                    self._send_typing("done")   # switched windows while typing
+                if self.input_buffer.strip() and _new_tgt:
+                    self._typing_last_key = time.monotonic()
+                    if time.monotonic() - self._typing_out_last >= 3.0:
+                        self._send_typing("active")
+                elif not self.input_buffer.strip() and self._typing_out_state in ("active", "paused"):
+                    self._send_typing("done")   # buffer cleared (Ctrl-U / backspace to empty)
 
             # ── 2. Immediate input refresh — bypasses the 30fps chat throttle ────
             # Typing, cursor movement and backspace feel instantaneous because the
@@ -6291,6 +7410,13 @@ class TUI:
             except asyncio.QueueEmpty:
                 pass
 
+            # ── 3b. Outgoing +typing=paused after 5 s of inactivity ──────────────
+            if (self._typing_out_state == "active"
+                    and self._typing_out_target
+                    and self.input_buffer.strip()
+                    and time.monotonic() - self._typing_last_key >= 5.0):
+                self._send_typing("paused")
+
             # ── 4. Dashboard auto-refresh ─────────────────────────────────────────
             now = time.monotonic()
             on_dashboard = (self.get_current_window().name == "*dashboard*")
@@ -6303,8 +7429,8 @@ class TUI:
                     self._dashboard_profile_locked = False  # consume lock; hold the profile
                 else:
                     self._dashboard_mode = "suspects"       # genuine navigate-back — reset
-            # Profile views (/summarize, /ai, /topai) hold for 60 s then expire.
-            if self._dashboard_mode == "profile" and now - self._dashboard_last_update >= 60.0:
+            # Profile views (/summarize, /ai, /topai) hold for 120 s then expire.
+            if self._dashboard_mode == "profile" and now - self._dashboard_last_update >= 120.0:
                 self._dashboard_mode = "suspects"
             self._prev_on_dashboard = on_dashboard
             # Auto-refresh is suppressed while showing a profile (/ai output) so
@@ -6400,15 +7526,22 @@ def _ensure_deps() -> bool:
     """Check for every required and optional package.
     Any that are absent are installed via pip automatically.
     Returns True if at least one package was installed (the process must
-    restart so that the freshly installed modules can be imported)."""
+    restart so that the freshly installed modules can be imported).
+    Skipped entirely when --no-install is set."""
+
+    if _NO_INSTALL:
+        return False
 
     # (import_name, pip_package_name, description_for_display)
     wanted: List[Tuple[str, str, str]] = [
         ("anthropic",    "anthropic",      "Claude API client  (/askai, /summarize)"),
         ("openai",       "openai",         "OpenAI API client  (/askai, /summarize with GPT models)"),
-        ("transformers", "transformers",   "AI text detection  (HuggingFace)"),
-        ("torch",        "torch",          "AI text detection  (PyTorch)"),
     ]
+    if not _NO_AI:
+        wanted += [
+            ("transformers", "transformers",   "AI text detection  (HuggingFace)"),
+            ("torch",        "torch",          "AI text detection  (PyTorch)"),
+        ]
     missing = [
         (imp, pkg, desc) for imp, pkg, desc in wanted
         if importlib.util.find_spec(imp) is None
@@ -6438,7 +7571,10 @@ def _ensure_deps() -> bool:
 
 
 def main():
-    global DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, DEFAULT_CHANNEL, NICKSERV_PASSWORD
+    global DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, DEFAULT_CHANNEL
+    global NICKSERV_PASSWORD, SASL_MECHANISM, SASL_CERT, SASL_KEY
+    global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GITHUB_TOKEN
+    global OLLAMA_URL, LLAMACPP_URL
 
     # Ensure the pre-curses terminal output can render Unicode box-drawing
     # characters and symbols on Windows (default console codec is cp1252).
@@ -6461,6 +7597,27 @@ def main():
     print("║       eyearesee  —  IRC client       ║")
     print("╚══════════════════════════════════════╝")
     print("  Press Enter to accept the [default].\n")
+
+    # Load all settings from irc_config.json; env vars are the fallback already
+    # applied at module level.  Config file takes precedence over env vars.
+    _saved = load_irc_config()
+
+    if _saved.get("server"):        DEFAULT_SERVER     = _saved["server"]
+    if _saved.get("port"):          DEFAULT_PORT       = int(_saved["port"])
+    if _saved.get("nick"):          DEFAULT_NICK       = _saved["nick"]
+    if _saved.get("channel"):       DEFAULT_CHANNEL    = _saved["channel"]
+    if _saved.get("sasl_mechanism"):SASL_MECHANISM     = _saved["sasl_mechanism"].upper()
+    if _saved.get("sasl_cert"):     SASL_CERT          = _saved["sasl_cert"]
+    if _saved.get("sasl_key"):      SASL_KEY           = _saved["sasl_key"]
+    if _saved.get("nickserv_password"): NICKSERV_PASSWORD = _saved["nickserv_password"]
+    if _saved.get("anthropic_api_key"): ANTHROPIC_API_KEY = _saved["anthropic_api_key"]
+    if _saved.get("openai_api_key"):    OPENAI_API_KEY    = _saved["openai_api_key"]
+    if _saved.get("deepseek_api_key"):  DEEPSEEK_API_KEY  = _saved["deepseek_api_key"]
+    if _saved.get("github_token"):      GITHUB_TOKEN      = _saved["github_token"]
+    if _saved.get("ollama_url"):        OLLAMA_URL        = _saved["ollama_url"]
+    if _saved.get("llamacpp_url"):      LLAMACPP_URL      = _saved["llamacpp_url"]
+
+    # ── IRC connection ───────────────────────────────────────────────────────────
 
     # Server — accepts host  or  host:port
     raw = input(f"  Server   [{DEFAULT_SERVER}] : ").strip()
@@ -6490,10 +7647,77 @@ def main():
         DEFAULT_CHANNEL = re.sub(r'[\x00-\x07\x09-\x1f\x7f ,]', '', DEFAULT_CHANNEL)[:50] \
                           or DEFAULT_CHANNEL
 
-    # NickServ password — hidden input, blank = skip
-    raw = getpass.getpass("  NickServ password (blank to skip) : ")
+    # ── SASL ────────────────────────────────────────────────────────────────────
+
+    _mech_hint = f"PLAIN/SCRAM-SHA-256/EXTERNAL/ECDSA-NIST256P-CHALLENGE"
+    raw = input(f"  SASL     [{SASL_MECHANISM}] ({_mech_hint}) : ").strip().upper()
+    if raw:
+        SASL_MECHANISM = raw
+
+    # NickServ / SASL password (PLAIN and SCRAM-SHA-256)
+    _pw_hint = "[configured]" if NICKSERV_PASSWORD else "blank to skip"
+    raw = getpass.getpass(f"  Password ({_pw_hint}) : ")
     if raw:
         NICKSERV_PASSWORD = raw
+
+    # Cert/key paths — only relevant for EXTERNAL and ECDSA
+    if SASL_MECHANISM in ("EXTERNAL", "ECDSA-NIST256P-CHALLENGE"):
+        if SASL_MECHANISM == "EXTERNAL":
+            _cert_hint = SASL_CERT or "path to PEM cert"
+            raw = input(f"  SASL cert [{_cert_hint}] : ").strip()
+            if raw:
+                SASL_CERT = raw
+        _key_hint = SASL_KEY or "path to PEM key"
+        raw = input(f"  SASL key  [{_key_hint}] : ").strip()
+        if raw:
+            SASL_KEY = raw
+
+    # ── AI API keys ──────────────────────────────────────────────────────────────
+
+    print()
+    print("  AI API keys — press Enter to keep existing value, '-' to clear.")
+
+    def _prompt_key(label: str, current: str) -> str:
+        hint = "[configured]" if current else "blank to skip"
+        val = input(f"  {label:<22} ({hint}) : ").strip()
+        if val == "-":
+            return ""
+        return val if val else current
+
+    ANTHROPIC_API_KEY = _prompt_key("Anthropic API key", ANTHROPIC_API_KEY)
+    OPENAI_API_KEY    = _prompt_key("OpenAI API key",    OPENAI_API_KEY)
+    DEEPSEEK_API_KEY  = _prompt_key("DeepSeek API key",  DEEPSEEK_API_KEY)
+    GITHUB_TOKEN      = _prompt_key("GitHub token",      GITHUB_TOKEN)
+
+    print()
+    print("  Local inference servers (press Enter to keep).")
+    raw = input(f"  Ollama URL    [{OLLAMA_URL}] : ").strip()
+    if raw:
+        OLLAMA_URL = raw
+    raw = input(f"  llama.cpp URL [{LLAMACPP_URL}] : ").strip()
+    if raw:
+        LLAMACPP_URL = raw
+
+    # ── Persist everything to irc_config.json ───────────────────────────────────
+    _cfg: dict = {
+        "server":            DEFAULT_SERVER,
+        "port":              DEFAULT_PORT,
+        "nick":              DEFAULT_NICK,
+        "channel":           DEFAULT_CHANNEL,
+        "sasl_mechanism":    SASL_MECHANISM,
+        "nickserv_password": NICKSERV_PASSWORD,
+        "ollama_url":        OLLAMA_URL,
+        "llamacpp_url":      LLAMACPP_URL,
+    }
+    # Cert/key only written when non-empty (paths are sensitive enough to omit
+    # if unused, and writing empty strings would clutter the file).
+    if SASL_CERT:     _cfg["sasl_cert"]          = SASL_CERT
+    if SASL_KEY:      _cfg["sasl_key"]            = SASL_KEY
+    if ANTHROPIC_API_KEY: _cfg["anthropic_api_key"] = ANTHROPIC_API_KEY
+    if OPENAI_API_KEY:    _cfg["openai_api_key"]    = OPENAI_API_KEY
+    if DEEPSEEK_API_KEY:  _cfg["deepseek_api_key"]  = DEEPSEEK_API_KEY
+    if GITHUB_TOKEN:      _cfg["github_token"]       = GITHUB_TOKEN
+    save_irc_config(_cfg)
 
     print(f"\n  → {DEFAULT_SERVER}:{DEFAULT_PORT} (SSL)  nick={DEFAULT_NICK}"
           + (f"  channel={DEFAULT_CHANNEL}" if DEFAULT_CHANNEL else ""))

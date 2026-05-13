@@ -10,7 +10,6 @@ DEFAULT_SETTINGS = {
 
 
 import base64
-import hmac
 import html
 import json
 import os
@@ -29,18 +28,6 @@ from PySide6.QtCore import QUrl
 from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtWidgets import QApplication, QMainWindow, QPushButton
 import hashlib
-
-# cryptography (optional — needed for SASL ECDSA-NIST256P-CHALLENGE)
-try:
-    from cryptography.hazmat.primitives.asymmetric import ec as _ecdsa_ec
-    from cryptography.hazmat.primitives import hashes as _ecdsa_hashes
-    from cryptography.hazmat.primitives.serialization import load_pem_private_key as _load_pem_private_key
-    CRYPTOGRAPHY_AVAILABLE = True
-except ImportError:
-    _ecdsa_ec = None  # type: ignore
-    _ecdsa_hashes = None  # type: ignore
-    _load_pem_private_key = None  # type: ignore
-    CRYPTOGRAPHY_AVAILABLE = False
 
 def get_nick_color(nick: str) -> str:
     # Strip any operator prefixes before hashing
@@ -154,15 +141,6 @@ DEFAULT_SERVER = "irc.libera.chat"
 DEFAULT_PORT = 6697
 DEFAULT_NICK = ""
 DEFAULT_CHANNEL = "#eyearesee"
-
-# SASL mechanism and credential paths. Supported mechanisms:
-#   PLAIN                    — password from connection settings
-#   SCRAM-SHA-256            — RFC-5802 SCRAM (uses connection password)
-#   EXTERNAL                 — TLS client certificate (IRC_SASL_CERT + IRC_SASL_KEY)
-#   ECDSA-NIST256P-CHALLENGE — EC challenge-response (IRC_SASL_KEY; needs 'cryptography')
-SASL_MECHANISM = os.environ.get("IRC_SASL_MECHANISM", "PLAIN").upper()
-SASL_CERT      = os.environ.get("IRC_SASL_CERT", "")
-SASL_KEY       = os.environ.get("IRC_SASL_KEY", "")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 HISTORY_PATH = SCRIPT_DIR / "connection_history.json"
@@ -471,15 +449,11 @@ class IRCClientThread(threading.Thread):
         "setname",
         "chathistory",
         "draft/chathistory",
-        "draft/multiline",
-        "message-redaction",
-        "read-marker",
-        "draft/read-marker",
-        "draft/account-registration",
         "monitor",
         "cap-notify",
         "draft/typing",
         "draft/event-playback",
+        "draft/read-marker",
         "knock",
     )
 
@@ -501,27 +475,20 @@ class IRCClientThread(threading.Thread):
         self._desired_nick = nick
         self._label_seq = 0
         self._sent_labels: set[str] = set()
-        self._pending_labels: set[str] = set()
         self._active_caps: set[str] = set()
         self._cap_ls_caps: set[str] = set()
         self._cap_ls_values: dict[str, str] = {}
         self._cap_req_queue: List[str] = []
         self._batch_buffer: dict[str, list] = {}
         self._batch_types: dict[str, str] = {}
-        self._batch_params: dict[str, list] = {}
         self._current_batch_is_replay = False
         self._chathistory_cap = ""
-        self._replay_enabled: bool = False
         self._isupport: dict[str, object] = {}
         self._current_msg_tags: dict = {}
         self._pending_names: Dict[str, set] = {}
         self._last_pong = time.monotonic()
         self._reader_timeout = 500
         self._typing_last_sent: Dict[str, float] = {}
-        self._sasl_state: dict = {}
-        self._auth_buffer: str = ""
-        self._network_announced: bool = False
-        self._account_map: Dict[str, str] = {}
 
     def emit(self, kind: str, **payload):
         payload["type"] = kind
@@ -575,70 +542,20 @@ class IRCClientThread(threading.Thread):
         m = re.match(r"^\(([^)]+)\)(.+)$", prefix)
         return m.group(2) if m else "~&@%+"
 
-    def _sasl_creds_ok(self) -> bool:
-        if SASL_MECHANISM == "EXTERNAL":
-            return bool(SASL_CERT and SASL_KEY)
-        if SASL_MECHANISM == "ECDSA-NIST256P-CHALLENGE":
-            return bool(SASL_KEY) and CRYPTOGRAPHY_AVAILABLE
-        return bool(self.password)  # PLAIN / SCRAM-SHA-256
-
     def _request_caps(self):
         want = [c for c in self.WANT_CAPS if c in self._cap_ls_caps]
-        # If both std and draft chathistory advertised, ask for std only —
-        # some servers NAK requests that name both variants.
-        if "chathistory" in want and "draft/chathistory" in want:
-            want.remove("draft/chathistory")
-        # Same dedup for read-marker.
-        if "read-marker" in want and "draft/read-marker" in want:
-            want.remove("draft/read-marker")
-        if "sasl" in self._cap_ls_caps and self._sasl_creds_ok():
+        if "sasl" in self._cap_ls_caps and self.password:
             sasl_val = self._cap_ls_values.get("sasl", "")
-            mechs = [m.strip().upper() for m in sasl_val.split(",")] if sasl_val else []
-            if not mechs or SASL_MECHANISM in mechs:
+            if not sasl_val or "PLAIN" in sasl_val.upper().split(","):
                 want.append("sasl")
         self.send_raw(f"CAP REQ :{' '.join(want)}" if want else "CAP END")
         self._cap_ls_caps.clear()
 
-    def _flush_cap_req_queue(self) -> None:
-        """Pop the next queued single-cap REQ, or send CAP END.
-
-        Used after CAP NAK to retry caps one at a time. SASL is
-        deliberately *not* flushed here: when SASL is in flight the
-        SASL numeric handlers (903/904) own CAP END.
-        """
+    def _flush_cap_req_queue(self):
         if self._cap_req_queue:
             self.send_raw(f"CAP REQ :{self._cap_req_queue.pop(0)}")
-        elif "sasl" not in self._active_caps:
+        else:
             self.send_raw("CAP END")
-
-    def _handle_sts(self, sts_value: str) -> None:
-        """Parse Strict Transport Security CAP value and warn if TLS upgrade needed."""
-        params: dict = {}
-        for part in sts_value.split(","):
-            if "=" in part:
-                k, v = part.split("=", 1)
-                params[k] = v
-            else:
-                params[part] = ""
-        port_str = params.get("port", "6697")
-        try:
-            port_int = int(port_str)
-            if not (1 <= port_int <= 65535):
-                raise ValueError
-            port = str(port_int)
-        except (TypeError, ValueError):
-            port = "6697"
-        try:
-            duration_int = int(params.get("duration", "0") or "0")
-        except (TypeError, ValueError):
-            duration_int = 0
-        if duration_int <= 0:
-            return  # policy revoked
-        preload = "preload" in params
-        msg = (f"[STS] Server requires TLS — reconnect with SSL on port {port} "
-               f"(policy duration={duration_int}s{', preload' if preload else ''}). "
-               f"Use /server {self.server} {port} ssl to upgrade.")
-        self.emit("status", text=msg)
 
     def connect(self) -> None:
         raw = socket.create_connection((self.server, self.port), timeout=30)
@@ -650,13 +567,6 @@ class IRCClientThread(threading.Thread):
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             # ----------------------------------
-            # SASL EXTERNAL: load the TLS client certificate so the server
-            # can derive identity from the cert during the TLS handshake.
-            if SASL_MECHANISM == "EXTERNAL" and SASL_CERT and SASL_KEY:
-                try:
-                    ctx.load_cert_chain(SASL_CERT, SASL_KEY)
-                except Exception as exc:
-                    self.emit("status", text=f"[SASL] EXTERNAL cert load failed: {exc}")
             self.sock = ctx.wrap_socket(raw, server_hostname=self.server)
             self.sock.settimeout(self._reader_timeout)
         else:
@@ -750,8 +660,7 @@ class IRCClientThread(threading.Thread):
     def _irc_cap(self, nick, params, prefix):
         subcmd = params[1].upper() if len(params) > 1 else ""
         if subcmd == "LS":
-            # CAP LS 302 sends caps across multiple lines; "*" means more coming.
-            more_coming = len(params) > 2 and params[2] == "*"
+            more = len(params) > 2 and params[2] == "*"
             for raw_cap in (params[-1] if params else "").split():
                 if "=" in raw_cap:
                     cname, cval = raw_cap.split("=", 1)
@@ -761,9 +670,7 @@ class IRCClientThread(threading.Thread):
                 self._cap_ls_caps.add(cname)
                 if cval:
                     self._cap_ls_values[cname] = cval
-            if not more_coming:
-                if "sts" in self._cap_ls_values and not self.use_ssl:
-                    self._handle_sts(self._cap_ls_values["sts"])
+            if not more:
                 if "chathistory" in self._cap_ls_caps:
                     self._chathistory_cap = "chathistory"
                 elif "draft/chathistory" in self._cap_ls_caps:
@@ -773,18 +680,15 @@ class IRCClientThread(threading.Thread):
             acked = set((params[-1] if params else "").lower().split())
             self._active_caps |= acked
             if "sasl" in acked:
-                self.send_raw(f"AUTHENTICATE {SASL_MECHANISM}")
+                self.send_raw("AUTHENTICATE PLAIN")
             else:
                 self._flush_cap_req_queue()
         elif subcmd == "NAK":
-            # Server rejected a batched REQ — retry each cap individually so
-            # we still get whichever subset the server actually supports.
             nak_caps = (params[-1] if params else "").lower().split()
             if len(nak_caps) > 1:
                 self._cap_req_queue.extend(nak_caps)
             self._flush_cap_req_queue()
         elif subcmd == "NEW":
-            # Dynamic cap announcement — request any we want that we don't have yet.
             new_avail: dict[str, str] = {}
             for raw_cap in (params[-1] if params else "").split():
                 if "=" in raw_cap:
@@ -795,7 +699,7 @@ class IRCClientThread(threading.Thread):
                 if cval:
                     self._cap_ls_values[cname.lower()] = cval
             if "sts" in new_avail and not self.use_ssl:
-                self._handle_sts(new_avail["sts"])
+                self.emit("status", text=f"[STS] {self.server} advertised TLS-only policy")
             want = [c for c in self.WANT_CAPS if c in new_avail and c not in self._active_caps]
             if want:
                 self.send_raw(f"CAP REQ :{' '.join(want)}")
@@ -804,221 +708,42 @@ class IRCClientThread(threading.Thread):
             self._active_caps -= removed
             self.emit("status", text=f"[cap] server withdrew: {' '.join(sorted(removed))}")
 
-    def _send_authenticate(self, payload: str) -> None:
-        """Send AUTHENTICATE with 400-char chunking per IRCv3 SASL spec."""
-        if not payload:
-            self.send_raw("AUTHENTICATE +")
-            return
-        for i in range(0, len(payload), 400):
-            self.send_raw(f"AUTHENTICATE {payload[i:i+400]}")
-        if len(payload) % 400 == 0:
-            # Exact multiple — trailing empty chunk signals end of message.
-            self.send_raw("AUTHENTICATE +")
-
-    def _sasl_plain(self, _challenge: str) -> None:
-        payload = base64.b64encode(
-            f"{self.nick}\0{self.nick}\0{self.password}".encode("utf-8")
-        ).decode()
-        self._send_authenticate(payload)
-
-    def _sasl_external(self, _challenge: str) -> None:
-        # Empty authzid — server derives identity from TLS client-cert CN/SAN.
-        self._send_authenticate("")
-
-    def _sasl_scram_sha256(self, server_data: str) -> None:
-        """SCRAM-SHA-256 (RFC 5802) state machine."""
-        step = self._sasl_state.get("step", 0)
-
-        if step == 0 and not self.password:
-            self.emit("status", text="[SASL] SCRAM-SHA-256 requires a password — aborting")
-            self.send_raw("AUTHENTICATE *")
-            self._sasl_state = {}
-            return
-
-        if step == 0:
-            cnonce = base64.b64encode(os.urandom(18)).decode()
-            safe_nick = self.nick.replace("=", "=3D").replace(",", "=2C")
-            cfm_bare = f"n={safe_nick},r={cnonce}"
-            cfm = f"n,,{cfm_bare}"
-            self._sasl_state = {"step": 1, "cnonce": cnonce, "cfm_bare": cfm_bare}
-            self._send_authenticate(base64.b64encode(cfm.encode("utf-8")).decode())
-
-        elif step == 1:
-            if not server_data:
-                self.emit("status", text="[SASL] SCRAM: empty server-first — aborting")
-                self.send_raw("AUTHENTICATE *")
-                self._sasl_state = {}
-                return
-            try:
-                sfm = base64.b64decode(server_data).decode("utf-8")
-            except Exception:
-                self.emit("status", text="[SASL] SCRAM: bad base64 from server — aborting")
-                self.send_raw("AUTHENTICATE *")
-                self._sasl_state = {}
-                return
-            sfm_parts: dict = {}
-            for part in sfm.split(","):
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    sfm_parts[k] = v
-
-            r = sfm_parts.get("r", "")
-            s = sfm_parts.get("s", "")
-            i_str = sfm_parts.get("i", "4096")
-            cnonce = self._sasl_state["cnonce"]
-
-            if not r.startswith(cnonce):
-                self.emit("status", text="[SASL] SCRAM: server nonce mismatch — aborting")
-                self.send_raw("AUTHENTICATE *")
-                self._sasl_state = {}
-                return
-
-            try:
-                salt = base64.b64decode(s)
-                iterations = int(i_str)
-            except Exception:
-                self.emit("status", text="[SASL] SCRAM: malformed salt/iterations — aborting")
-                self.send_raw("AUTHENTICATE *")
-                self._sasl_state = {}
-                return
-            pw = self.password.encode("utf-8")
-
-            salted_pw  = hashlib.pbkdf2_hmac("sha256", pw, salt, iterations)
-            client_key = hmac.new(salted_pw, b"Client Key", hashlib.sha256).digest()
-            stored_key = hashlib.sha256(client_key).digest()
-            server_key = hmac.new(salted_pw, b"Server Key", hashlib.sha256).digest()
-
-            cb = base64.b64encode(b"n,,").decode()
-            cfw_noproof = f"c={cb},r={r}"
-            auth_message = f"{self._sasl_state['cfm_bare']},{sfm},{cfw_noproof}"
-
-            client_sig   = hmac.new(stored_key, auth_message.encode("utf-8"), hashlib.sha256).digest()
-            client_proof = bytes(a ^ b for a, b in zip(client_key, client_sig))
-            server_sig   = hmac.new(server_key, auth_message.encode("utf-8"), hashlib.sha256).digest()
-
-            cfm_final = f"{cfw_noproof},p={base64.b64encode(client_proof).decode()}"
-            self._sasl_state = {
-                "step": 2,
-                "expected_server_sig": base64.b64encode(server_sig).decode(),
-            }
-            self._send_authenticate(base64.b64encode(cfm_final.encode("utf-8")).decode())
-
-        elif step == 2:
-            # Server-final-message (optional — server may go straight to 903).
-            if server_data:
-                try:
-                    sfinal = base64.b64decode(server_data).decode("utf-8")
-                    for part in sfinal.split(","):
-                        if part.startswith("v="):
-                            expected = self._sasl_state.get("expected_server_sig", "")
-                            if part[2:] != expected:
-                                self.emit("status", text="[SASL] SCRAM: server signature mismatch (MITM?)")
-                            break
-                except Exception:
-                    pass
-            self._sasl_state = {}
-
-    def _sasl_ecdsa(self, server_data: str) -> None:
-        """ECDSA-NIST256P-CHALLENGE state machine."""
-        step = self._sasl_state.get("step", 0)
-
-        if step == 0:
-            self._sasl_state = {"step": 1}
-            self._send_authenticate(base64.b64encode(self.nick.encode("utf-8")).decode())
-
-        elif step == 1:
-            if not server_data:
-                self.emit("status", text="[SASL] ECDSA: empty challenge — aborting")
-                self.send_raw("AUTHENTICATE *")
-                self._sasl_state = {}
-                return
-            if not CRYPTOGRAPHY_AVAILABLE:
-                self.emit("status", text="[SASL] ECDSA requires the 'cryptography' package — pip install cryptography")
-                self.send_raw("AUTHENTICATE *")
-                self._sasl_state = {}
-                return
-            if not SASL_KEY:
-                self.emit("status", text="[SASL] ECDSA: IRC_SASL_KEY not set — aborting")
-                self.send_raw("AUTHENTICATE *")
-                self._sasl_state = {}
-                return
-            try:
-                challenge_bytes = base64.b64decode(server_data)
-                with open(SASL_KEY, "rb") as _kf:
-                    private_key = _load_pem_private_key(_kf.read(), password=None)
-                sig = private_key.sign(challenge_bytes, _ecdsa_ec.ECDSA(_ecdsa_hashes.SHA256()))
-                self._send_authenticate(base64.b64encode(sig).decode())
-                self._sasl_state = {}
-            except Exception as exc:
-                self.emit("status", text=f"[SASL] ECDSA signing failed: {exc}")
-                self.send_raw("AUTHENTICATE *")
-                self._sasl_state = {}
-
     def _irc_authenticate(self, nick, params, prefix):
-        chunk = params[0] if params else "+"
-        # IRCv3 SASL: each chunk is ≤ 400 chars of base64; accumulate until
-        # we get a short chunk (or "+"). "+" alone means empty payload.
-        if len(chunk) == 400:
-            self._auth_buffer += chunk
-            return
-        server_data = self._auth_buffer + ("" if chunk == "+" else chunk)
-        self._auth_buffer = ""
-
-        mech = SASL_MECHANISM
-        if mech == "PLAIN":
-            self._sasl_plain(server_data)
-        elif mech == "EXTERNAL":
-            self._sasl_external(server_data)
-        elif mech == "SCRAM-SHA-256":
-            self._sasl_scram_sha256(server_data)
-        elif mech == "ECDSA-NIST256P-CHALLENGE":
-            self._sasl_ecdsa(server_data)
-        else:
-            self.emit("status", text=f"[SASL] Unknown mechanism '{mech}' — aborting")
-            self.send_raw("AUTHENTICATE *")
-
-    def _irc_900(self, nick, params, prefix):  # RPL_LOGGEDIN
-        account = params[2] if len(params) > 2 else "?"
-        self.emit("status", text=f"Logged in as {account}")
-
-    def _irc_901(self, nick, params, prefix):  # RPL_LOGGEDOUT
-        self.emit("status", text="Logged out of services")
+        if params and params[0] == "+":
+            raw = f"{self.nick}\0{self.nick}\0{self.password}".encode()
+            payload = base64.b64encode(raw).decode()
+            for i in range(0, len(payload), 400):
+                self.send_raw(f"AUTHENTICATE {payload[i:i+400]}")
+            if len(payload) % 400 == 0:
+                self.send_raw("AUTHENTICATE +")
 
     def _irc_903(self, nick, params, prefix):
         self._identified = True
         self.emit("status", text="SASL authentication successful")
-        self._sasl_state = {}
-        self._auth_buffer = ""
         self.send_raw("CAP END")
 
     def _irc_904(self, nick, params, prefix):
         self.emit("status", text="SASL authentication failed, falling back to NickServ")
         self.send_raw("AUTHENTICATE *")
-        self._sasl_state = {}
-        self._auth_buffer = ""
         self.send_raw("CAP END")
 
     def _irc_902(self, nick, params, prefix):
         self.emit("status", text="SASL failed: nick locked or registered")
         self.send_raw("AUTHENTICATE *")
-        self._sasl_state = {}
         self.send_raw("CAP END")
 
     def _irc_906(self, nick, params, prefix):
         self.emit("status", text="SASL authentication aborted")
-        self._sasl_state = {}
         self.send_raw("CAP END")
 
     def _irc_907(self, nick, params, prefix):
         self.emit("status", text="Already authenticated via SASL")
-        self._sasl_state = {}
         self.send_raw("CAP END")
 
     def _irc_908(self, nick, params, prefix):
         mechs = params[-1] if params else ""
         self.emit("status", text=f"SASL mechanisms available: {mechs}")
-        mech_set = {m.strip().upper() for m in mechs.split(",") if m.strip()}
-        if SASL_MECHANISM not in mech_set:
+        if "PLAIN" not in mechs.upper().split(","):
             self.send_raw("AUTHENTICATE *")
             self.send_raw("CAP END")
 
@@ -1162,187 +887,25 @@ class IRCClientThread(threading.Thread):
             ref = ref_dir[1:]
             self._batch_buffer[ref] = []
             self._batch_types[ref] = params[1] if len(params) > 1 else ""
-            self._batch_params[ref] = list(params)
         elif ref_dir.startswith("-"):
             ref = ref_dir[1:]
-            buffered    = self._batch_buffer.pop(ref, [])
-            batch_type  = self._batch_types.pop(ref, "")
-            open_params = self._batch_params.pop(ref, [])
-            if batch_type == "draft/multiline":
-                self._handle_multiline_batch(buffered, open_params)
-                return
-            is_replay = batch_type in ("chathistory", "draft/chathistory")
-            prev_replay = self._current_batch_is_replay
-            self._current_batch_is_replay = is_replay
-            try:
-                for bcmd, bnick, bparams, bprefix, btags in buffered:
-                    handler = getattr(self, f"_irc_{bcmd.lower()}", None)
-                    if handler:
-                        self._current_msg_tags = btags
-                        try:
-                            handler(bnick, bparams, bprefix)
-                        except Exception as batch_exc:
-                            self.emit("status", text=f"[err] batch {bcmd}: {batch_exc}")
-            finally:
-                self._current_batch_is_replay = prev_replay
-                self._current_msg_tags = {}
-
-    def _handle_multiline_batch(self, buffered: list, open_params: list) -> None:
-        """Combine draft/multiline batch lines into a single PRIVMSG dispatch."""
-        target = open_params[2] if len(open_params) > 2 else ""
-        if not target or not buffered:
-            return
-        combined: list = []
-        first_tags: dict = {}
-        first_nick: str = ""
-        for bcmd, bnick, bparams, bprefix, btags in buffered:
-            if bcmd != "PRIVMSG":
-                continue
-            if not first_nick:
-                first_nick = bnick
-                first_tags = btags
-            line_text = bparams[1] if len(bparams) > 1 else ""
-            concat = "draft/multiline-concat" in btags
-            if combined and not concat:
-                combined.append("\n")
-            combined.append(line_text)
-        if not combined or not first_nick:
-            return
-        combined_text = "".join(combined)
-        prev_tags = self._current_msg_tags
-        self._current_msg_tags = first_tags
-        try:
-            self._irc_privmsg(first_nick, [target, combined_text], "")
-        finally:
-            self._current_msg_tags = prev_tags
+            buffered = self._batch_buffer.pop(ref, [])
+            batch_type = self._batch_types.pop(ref, "")
+            if batch_type == "draft/multiline" and buffered:
+                first_pm = next((x for x in buffered if x[0] == "PRIVMSG"), None)
+                if first_pm:
+                    _, bnick, bparams, _, btags = first_pm
+                    target = bparams[0] if len(bparams) > 0 else ""
+                    merged = "\n".join(x[2][1] for x in buffered if x[0] == "PRIVMSG" and len(x[2]) > 1)
+                    self.emit("message", nick=bnick, target=target, text=merged, ts=_ts(), action=False, self_msg=(bnick == self.nick), direct=(target == self.nick), mention=(self.nick.lower() in merged.lower()))
 
     def _irc_tagmsg(self, nick, params, prefix):
         if not params:
             return
         target = params[0]
-        tags = self._current_msg_tags
-        state = tags.get("+typing") or tags.get("typing")
+        state = self._current_msg_tags.get("+typing") or self._current_msg_tags.get("typing") or self._current_msg_tags.get("+typing".lower())
         if isinstance(state, str) and state:
             self.emit("typing", channel=target, nick=nick, state=state, ts=_ts())
-        react    = tags.get("+react", "")
-        reply_to = tags.get("+reply", "")
-        if react and reply_to:
-            self.emit("react", nick=nick, target=target, reply_to=reply_to, react=react, ts=self._ts_from_tags())
-
-    # ------------------------------------------------------------------
-    # IRCv3 capability message handlers
-    # ------------------------------------------------------------------
-
-    def _irc_away(self, nick, params, prefix):
-        # away-notify cap: peer announces away/back state
-        reason = params[-1] if params else ""
-        if reason:
-            self.emit("status", text=f"* {nick} is away: {reason}")
-        else:
-            self.emit("status", text=f"* {nick} is back")
-
-    def _irc_chghost(self, nick, params, prefix):
-        new_user = params[0] if params else ""
-        new_host = params[1] if len(params) > 1 else ""
-        self.emit("status", text=f"* {nick} changed host to {new_user}@{new_host}")
-        self.emit("chghost", nick=nick, user=new_user, host=new_host, ts=_ts())
-
-    def _irc_account(self, nick, params, prefix):
-        account = params[0] if params else "*"
-        if account == "*":
-            self._account_map.pop(nick, None)
-            self.emit("status", text=f"* {nick} logged out of services")
-        else:
-            self._account_map[nick] = account
-            self.emit("status", text=f"* {nick} is identified as {account}")
-        self.emit("account", nick=nick, account="" if account == "*" else account, ts=_ts())
-
-    def _irc_setname(self, nick, params, prefix):
-        realname = params[0] if params else ""
-        self.emit("status", text=f"* {nick} changed real name to: {realname}")
-        self.emit("setname", nick=nick, realname=realname, ts=_ts())
-
-    def _irc_invite(self, nick, params, prefix):
-        if len(params) < 2:
-            return
-        invitee = params[0]
-        channel = params[1]
-        if self._irc_lower(invitee) == self._irc_lower(self.nick):
-            self.emit("status", text=f"*** {nick} invites you to join {channel}")
-        else:
-            self.emit("status", text=f"*** {nick} invited {invitee} to {channel}")
-        self.emit("invite", nick=nick, invitee=invitee, channel=channel, ts=_ts())
-
-    def _irc_fail(self, nick, params, prefix):
-        self.emit("status", text=f"[FAIL] {' '.join(params)}")
-
-    def _irc_warn(self, nick, params, prefix):
-        self.emit("status", text=f"[WARN] {' '.join(params)}")
-
-    def _irc_note(self, nick, params, prefix):
-        self.emit("status", text=f"[NOTE] {' '.join(params)}")
-
-    def _irc_redact(self, nick, params, prefix):
-        """Incoming REDACT command (message-redaction CAP)."""
-        if len(params) < 2:
-            return
-        target = params[0]
-        msgid  = params[1]
-        reason = params[2] if len(params) > 2 else ""
-        self.emit("redact", nick=nick, target=target, msgid=msgid, reason=reason, ts=_ts())
-
-    def _irc_markread(self, nick, params, prefix):
-        """Incoming MARKREAD response (read-marker CAP)."""
-        if len(params) < 2:
-            return
-        target = params[0]
-        ts_arg = params[1]  # e.g. "timestamp=2024-01-15T14:30:00.000Z"
-        self.emit("markread", target=target, ts_arg=ts_arg)
-
-    # ------------------------------------------------------------------
-    # MONITOR numeric replies
-    # ------------------------------------------------------------------
-
-    def _irc_730(self, nick, params, prefix):  # RPL_MONONLINE
-        for entry in (params[-1] if params else "").split(","):
-            if entry:
-                bare = entry.split("!")[0] if "!" in entry else entry
-                self.emit("status", text=f"[monitor] {bare} is online")
-
-    def _irc_731(self, nick, params, prefix):  # RPL_MONOFFLINE
-        for n in (params[-1] if params else "").split(","):
-            if n:
-                self.emit("status", text=f"[monitor] {n} is offline")
-
-    def _irc_732(self, nick, params, prefix):  # RPL_MONLIST
-        nicks = [n for n in (params[-1] if params else "").split(",") if n]
-        if nicks:
-            self.emit("status", text=f"[monitor] watching: {', '.join(nicks)}")
-
-    def _irc_734(self, nick, params, prefix):  # ERR_MONLISTFULL
-        self.emit("status", text=f"[monitor] list full — {' '.join(params[1:])}")
-
-    # ------------------------------------------------------------------
-    # draft/account-registration numerics
-    # ------------------------------------------------------------------
-
-    def _irc_920(self, nick, params, prefix):  # RPL_REG_SUCCESS
-        acct = params[1] if len(params) > 1 else "?"
-        self.emit("status", text=f"[register] '{acct}' registered successfully")
-
-    def _irc_921(self, nick, params, prefix):  # RPL_REG_VERIFICATION_REQUIRED
-        acct = params[1] if len(params) > 1 else "?"
-        detail = params[-1] if len(params) > 2 else ""
-        self.emit("status", text=f"[register] '{acct}' needs email verification" + (f" — {detail}" if detail else ""))
-
-    def _irc_922(self, nick, params, prefix):
-        self.emit("status", text=f"[register] error: {params[-1] if params else 'unknown error'}")
-
-    def _irc_923(self, nick, params, prefix):
-        self.emit("status", text=f"[register] error: {params[-1] if params else 'unknown error'}")
-
-    def _irc_924(self, nick, params, prefix):
-        self.emit("status", text=f"[register] error: {params[-1] if params else 'unknown error'}")
 
     def _irc_301(self, nick, params, prefix):
         if len(params) >= 2:
@@ -1385,96 +948,6 @@ class IRCClientThread(threading.Thread):
 
     def cmd_quit(self, reason: str = "Leaving"):
         self.disconnect(reason)
-
-    def cmd_chathistory(self, channel: str, count: int = 50) -> None:
-        """Request chat history (chathistory CAP). LATEST <count> events on <channel>."""
-        if self._chathistory_cap:
-            self.send_raw(f"CHATHISTORY LATEST {channel} * {count}")
-        else:
-            self.emit("status", text="Server does not support chat history (chathistory CAP missing)")
-
-    def cmd_chathistory_before(self, channel: str, ts: str, count: int = 50) -> None:
-        if self._chathistory_cap:
-            self.send_raw(f"CHATHISTORY BEFORE {channel} timestamp={ts} {count}")
-        else:
-            self.emit("status", text="Server does not support chat history (chathistory CAP missing)")
-
-    def cmd_setname(self, realname: str) -> None:
-        """Update real name on the fly (setname CAP)."""
-        if "setname" in self._active_caps:
-            self.send_raw(f"SETNAME :{realname}")
-        else:
-            self.emit("status", text="Server does not support SETNAME (setname CAP missing)")
-
-    def cmd_register(self, account: str, email: str, password: str) -> None:
-        """draft/account-registration: REGISTER <account> <email> <password>."""
-        if "draft/account-registration" not in self._active_caps:
-            self.emit("status", text="Server does not support account registration (cap missing)")
-            return
-        self.send_raw(f"REGISTER {account} {email} {password}")
-
-    def cmd_verify(self, account: str, code: str) -> None:
-        """draft/account-registration: VERIFY <account> <code>."""
-        self.send_raw(f"VERIFY {account} {code}")
-
-    def cmd_redact(self, target: str, msgid: str, reason: str = "") -> None:
-        """Send a REDACT request (message-redaction CAP)."""
-        if "message-redaction" not in self._active_caps:
-            self.emit("status", text="Server does not support message redaction (cap missing)")
-            return
-        if reason:
-            self.send_raw(f"REDACT {target} {msgid} :{reason}")
-        else:
-            self.send_raw(f"REDACT {target} {msgid}")
-
-    def cmd_markread(self, target: str, ts: str = "") -> None:
-        """Send a MARKREAD command (read-marker CAP). ts in 'timestamp=YYYY-...' form."""
-        if "read-marker" not in self._active_caps and "draft/read-marker" not in self._active_caps:
-            self.emit("status", text="Server does not support read markers (cap missing)")
-            return
-        if ts:
-            self.send_raw(f"MARKREAD {target} {ts}")
-        else:
-            self.send_raw(f"MARKREAD {target}")
-
-    def cmd_tagmsg(self, target: str, tags: dict) -> None:
-        """Send a TAGMSG (client-only tags, no visible body text)."""
-        self.send_tagged(tags, f"TAGMSG {target}")
-
-    def cmd_react(self, target: str, reply_to_msgid: str, react: str) -> None:
-        """Send a reaction via TAGMSG with +react/+reply tags."""
-        self.send_tagged({"+react": react, "+reply": reply_to_msgid}, f"TAGMSG {target}")
-
-    def cmd_monitor(self, action: str, *targets: str) -> None:
-        """MONITOR +/-/L/C/S — monitor cap commands."""
-        if targets:
-            self.send_raw(f"MONITOR {action} {','.join(targets)}")
-        else:
-            self.send_raw(f"MONITOR {action}")
-
-    def cmd_knock(self, channel: str, message: str = "") -> None:
-        """KNOCK on an invite-only channel (knock CAP)."""
-        if message:
-            self.send_raw(f"KNOCK {channel} :{message}")
-        else:
-            self.send_raw(f"KNOCK {channel}")
-
-    def cmd_msg_multiline(self, target: str, lines: List[str]) -> None:
-        """Send a draft/multiline batch — emits BATCH +ref draft/multiline target,
-        a PRIVMSG per line, then BATCH -ref. Falls back to plain PRIVMSGs if the
-        cap is not active.
-        """
-        if "draft/multiline" not in self._active_caps or len(lines) <= 1:
-            for line in lines:
-                self.cmd_msg(target, line)
-            return
-        self._label_seq += 1
-        ref = f"ml-{self._label_seq}"
-        self.send_raw(f"BATCH +{ref} draft/multiline {target}")
-        for line in lines:
-            tagged = f"@batch={ref} PRIVMSG {target} :{line}"
-            self.send_raw(tagged)
-        self.send_raw(f"BATCH -{ref}")
 
     def send_typing(self, target: str, state: str = "active"):
         if "message-tags" not in self._active_caps:
